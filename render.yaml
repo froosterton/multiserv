@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: discord-monitor-bot
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: DISCORD_TOKEN
+        value: ODAzMzc0MDgyODE2MzQ0MDk0.G8QsjH.U965vGebzKvH7hILJPeShMFV24ku2Qgr9gtvxU
+      - key: NODE_ENV
+        value: production 
