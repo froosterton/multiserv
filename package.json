@@ -1,0 +1,21 @@
+{
+  "name": "discord-monitor-bot",
+  "version": "1.0.0",
+  "description": "Discord bot for monitoring channel messages and checking Roblox values",
+  "main": "multi.js",
+  "scripts": {
+    "start": "node multi.js",
+    "dev": "node multi.js"
+  },
+  "dependencies": {
+    "discord.js-selfbot-v13": "^2.15.0",
+    "axios": "^1.6.0",
+    "selenium-webdriver": "^4.15.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["discord", "bot", "roblox", "monitor"],
+  "author": "Your Name",
+  "license": "MIT"
+}
