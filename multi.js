@@ -38,7 +38,7 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const BOT_ID = '298796807323123712';
 
 // Value threshold
-const VALUE_THRESHOLD = 50000;
+const VALUE_THRESHOLD = 100000;
 
 let blockedUsers = new Set();
 async function fetchBlockedUsers() {
