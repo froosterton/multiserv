@@ -14,21 +14,21 @@ const MONITOR_CHANNEL_IDS = [
   '749645946719174757', '755810466214707220', '749629644277416048'  // Guild 749629643836882975
 ];
 
-// Map monitor channels to their corresponding command channels
+// Map monitor channels to their corresponding whois channels
 // Command guild: 1465604866952007815
 // Channel 1465604867824291905 handles commands for guild 749629643836882975
 // Channel 1465604923189231669 handles commands for guild 786851062219931690
 // Channel 1465604933767266422 handles commands for guild 907175349706706974
 const CHANNEL_MAPPING = {
-  // Guild 907175349706706974 -> command channel 1465604933767266422
+  // Guild 907175349706706974 -> whois channel 1465604933767266422
   '907175350348423224': '1465604933767266422',
   '1391793760354173098': '1465604933767266422',
   '907175350570717224': '1465604933767266422',
-  // Guild 786851062219931690 -> command channel 1465604923189231669
+  // Guild 786851062219931690 -> whois channel 1465604923189231669
   '808540135666745345': '1465604923189231669',
   '792178431419744286': '1465604923189231669',
   '786851062219931693': '1465604923189231669',
-  // Guild 749629643836882975 -> command channel 1465604867824291905
+  // Guild 749629643836882975 -> whois channel 1465604867824291905
   '749645946719174757': '1465604867824291905',
   '755810466214707220': '1465604867824291905',
   '749629644277416048': '1465604867824291905'
@@ -135,14 +135,14 @@ client.on('messageCreate', async (message) => {
 
   // Role filtering removed - monitor all users
 
-  // Get the corresponding command channel for this monitor channel
-  const commandChannelId = CHANNEL_MAPPING[message.channel.id];
-  if (!commandChannelId) {
-    console.log(`[Monitor] No command channel mapping found for ${message.channel.id}`);
+  // Get the corresponding whois channel for this monitor channel
+  const whoisChannelId = CHANNEL_MAPPING[message.channel.id];
+  if (!whoisChannelId) {
+    console.log(`[Monitor] No whois channel mapping found for ${message.channel.id}`);
     return;
   }
 
-  // Store the message info keyed by Discord ID (for now)
+  // Store the message info keyed by Discord ID (same pattern as working code)
   pendingRoblox.set(message.author.id, {
     discordId: message.author.id,
     discordTag: message.author.tag,
@@ -152,22 +152,22 @@ client.on('messageCreate', async (message) => {
     channelName: message.channel.name,
     messageId: message.id,
     guildId: message.guild.id,
-    commandChannelId: commandChannelId
+    whoisChannelId: whoisChannelId
   });
   
-  const commandChannel = await client.channels.fetch(commandChannelId);
-  if (!commandChannel) return;
-  await commandChannel.sendSlash(BOT_ID, 'whois discord', message.author.id);
-  console.log(`[Monitor] Sent /whois discord for ${message.author.tag} (${message.author.id}) in #${message.channel.name} -> command channel ${commandChannelId}`);
+  const whoisChannel = await client.channels.fetch(whoisChannelId);
+  if (!whoisChannel) return;
+  await whoisChannel.sendSlash(BOT_ID, 'whois discord', message.author.id);
+  console.log(`[Monitor] Sent /whois discord for ${message.author.tag} (${message.author.id}) in #${message.channel.name} -> whois channel ${whoisChannelId}`);
 });
 
 // Listen for bot responses globally
 client.on('messageCreate', async (message) => {
-  // Check if this is a bot response in any of our command channels
-  const commandChannelIds = Object.values(CHANNEL_MAPPING);
+  // Check if this is a bot response in any of our whois channels
+  const whoisChannelIds = Object.values(CHANNEL_MAPPING);
   if (
     message.author.id === BOT_ID &&
-    commandChannelIds.includes(message.channel.id) &&
+    whoisChannelIds.includes(message.channel.id) &&
     message.embeds &&
     message.embeds.length > 0 &&
     message.embeds[0].fields
@@ -181,8 +181,7 @@ client.on('messageCreate', async (message) => {
     }
     if (!robloxUserId) return;
 
-    // Find the pending request that matches this Roblox user ID
-    // We'll need to scrape Rolimons to get the Discord ID, so we check all pending
+    // Same matching flow as the working script
     for (const [discordId, msg] of pendingRoblox.entries()) {
       if (processedUsers.has(discordId)) continue;
       
