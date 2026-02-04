@@ -1,30 +1,23 @@
 const { Client } = require('discord.js-selfbot-v13');
 const axios = require('axios');
 
-// Use environment variable for token (more secure)
 const TOKEN = process.env.DISCORD_TOKEN;
 
-// Monitor channels for each guild
-// Guild 907175349706706974: channels 907175350348423224, 1391793760354173098, 907175350570717224
-// Guild 786851062219931690: channels 808540135666745345, 792178431419744286, 786851062219931693
-// Guild 749629643836882975: channels 749645946719174757, 755810466214707220, 749629644277416048
 const MONITOR_CHANNEL_IDS = [
-  '907175350348423224', '1391793760354173098', '907175350570717224', // Guild 907175349706706974
-  '808540135666745345', '792178431419744286', '786851062219931693', // Guild 786851062219931690
-  '749645946719174757', '755810466214707220', '749629644277416048'  // Guild 749629643836882975
+  '907175350348423224', '1391793760354173098', '907175350570717224',
+  '808540135666745345', '792178431419744286', '786851062219931693',
+  '749645946719174757', '755810466214707220', '749629644277416048'
 ];
 
-// Map monitor channels to their corresponding whois/command channels (all in guild 1465604866952007815)
 const CHANNEL_MAPPING = {
-  // Guild 907175349706706974 -> whois channel 1465604933767266422
   '907175350348423224': '1465604933767266422',
   '1391793760354173098': '1465604933767266422',
   '907175350570717224': '1465604933767266422',
-  // Guild 786851062219931690 -> whois channel 1465604923189231669
+
   '808540135666745345': '1465604923189231669',
   '792178431419744286': '1465604923189231669',
   '786851062219931693': '1465604923189231669',
-  // Guild 749629643836882975 -> whois channel 1465604867824291905
+
   '749645946719174757': '1465604867824291905',
   '755810466214707220': '1465604867824291905',
   '749629644277416048': '1465604867824291905'
@@ -32,8 +25,6 @@ const CHANNEL_MAPPING = {
 
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const BOT_ID = '298796807323123712';
-
-// Value threshold
 const VALUE_THRESHOLD = 100000;
 
 let blockedUsers = new Set();
@@ -49,7 +40,6 @@ async function fetchBlockedUsers() {
   }
 }
 
-// FAST: Use Roblox API for RAP (much faster than scraping)
 async function fetchRobloxRAP(robloxUserId) {
   let rap = 0;
   let cursor = undefined;
@@ -58,17 +48,12 @@ async function fetchRobloxRAP(robloxUserId) {
     while (true) {
       const { data } = await axios.get(
         `https://inventory.roblox.com/v1/users/${robloxUserId}/assets/collectibles`,
-        {
-          params: { limit: 100, sortOrder: 'Asc', cursor },
-          timeout: 2000
-        }
+        { params: { limit: 100, sortOrder: 'Asc', cursor }, timeout: 2000 }
       );
 
       if (!data || !Array.isArray(data.data) || data.data.length === 0) break;
 
-      for (const entry of data.data) {
-        rap += Number(entry.recentAveragePrice || 0);
-      }
+      for (const entry of data.data) rap += Number(entry.recentAveragePrice || 0);
 
       if (data.nextPageCursor) cursor = data.nextPageCursor;
       else break;
@@ -87,216 +72,257 @@ async function fetchRobloxAvatar(robloxUserId) {
       timeout: 1500
     });
     return (data?.data?.[0]?.imageUrl) || '';
-  } catch (error) {
+  } catch {
     return '';
   }
 }
 
-// OPTIMIZED: Fast path - get RAP and avatar
 async function scrapeRolimons(robloxUserId) {
   const rolimonsUrl = `https://www.rolimons.com/player/${robloxUserId}`;
-
   const [rap, avatarUrl] = await Promise.all([
     fetchRobloxRAP(robloxUserId),
     fetchRobloxAvatar(robloxUserId)
   ]);
+  return { value: rap, avatarUrl, rolimonsUrl };
+}
 
-  return {
-    value: rap,
-    avatarUrl,
-    rolimonsUrl
-  };
+function normTag(tag) {
+  return String(tag || '').trim().toLowerCase();
+}
+
+// Try hard to extract a Discord tag like name#1234 or name#0 from a string
+function extractDiscordTag(text) {
+  const s = String(text || '').replace(/`/g, '').trim();
+  const m = s.match(/([^\s`]+#\d{1,4})/);
+  return m ? m[1] : '';
+}
+
+function extractRobloxUserIdFromEmbed(embed) {
+  for (const field of embed.fields || []) {
+    const name = String(field.name || '').toLowerCase();
+    const value = String(field.value || '').replace(/`/g, '').trim();
+    if (name.includes('roblox user id')) return value.replace(/\D/g, '');
+  }
+  return '';
+}
+
+function extractDiscordTagFromEmbed(embed) {
+  // Prefer a field if it exists
+  for (const field of embed.fields || []) {
+    const name = String(field.name || '').toLowerCase();
+    const value = String(field.value || '');
+    if (name.includes('discord') && (name.includes('user') || name.includes('username') || name.includes('account'))) {
+      const tag = extractDiscordTag(value);
+      if (tag) return tag;
+    }
+    if (name.includes('discord username')) {
+      const tag = extractDiscordTag(value);
+      if (tag) return tag;
+    }
+  }
+
+  // Fallback: scan other common embed text surfaces
+  const candidates = [
+    embed.title,
+    embed.description,
+    embed.author?.name,
+    ...(embed.footer?.text ? [embed.footer.text] : [])
+  ];
+  for (const c of candidates) {
+    const tag = extractDiscordTag(c);
+    if (tag) return tag;
+  }
+
+  return '';
 }
 
 const client = new Client({ checkUpdate: false });
 
-let processedUsers = new Set();
-let pendingRoblox = new Map();
-let webhookSent = new Set();
-// per-whois-channel FIFO queue of discordIds (fallback only)
-let pendingByWhoisChannel = new Map();
+// Hard dedupe
+const processedDiscordIds = new Set();
+const inFlightDiscordIds = new Set(); // queued/sent whois, waiting for rover/processing
+const webhookSent = new Set();
+
+// Pending info keyed by Discord ID
+const pendingByDiscordId = new Map();
+
+// Per-whois-channel queue of pending users (for matching by discordTag)
+const pendingByWhoisChannel = new Map(); // whoisChannelId -> Array<{ discordId, discordTagLower }>
 
 client.on('ready', async () => {
   console.log(`[Monitor] Logged in as ${client.user.tag}`);
   await fetchBlockedUsers();
   console.log(`[Monitor] Bot ready and monitoring ${MONITOR_CHANNEL_IDS.length} channels!`);
-  console.log(`[Monitor] Channels: ${MONITOR_CHANNEL_IDS.join(', ')}`);
-  console.log(`[Monitor] Channel mapping:`, CHANNEL_MAPPING);
 });
 
-// Monitor user messages
 client.on('messageCreate', async (message) => {
-  if (blockedUsers.has(message.author.id)) return;
-  if (!MONITOR_CHANNEL_IDS.includes(message.channel.id)) return;
-  if (message.author.bot) return;
-  if (processedUsers.has(message.author.id)) return;
-
-  // Role filtering removed - monitor all users
-
-  // Get the corresponding whois channel for this monitor channel
-  const whoisChannelId = CHANNEL_MAPPING[message.channel.id];
-  if (!whoisChannelId) {
-    console.log(`[Monitor] No whois channel mapping found for ${message.channel.id}`);
-    return;
-  }
-
-  // Store the message info keyed by Discord ID
-  pendingRoblox.set(message.author.id, {
-    discordId: message.author.id,
-    discordTag: message.author.tag,
-    content: message.content,
-    timestamp: message.createdTimestamp,
-    channelId: message.channel.id,
-    channelName: message.channel.name,
-    messageId: message.id,
-    guildId: message.guild.id,
-    whoisChannelId
-  });
-
-  // Enqueue this Discord ID for that whois channel (fallback if embed has no Discord ID)
-  if (!pendingByWhoisChannel.has(whoisChannelId)) {
-    pendingByWhoisChannel.set(whoisChannelId, []);
-  }
-  pendingByWhoisChannel.get(whoisChannelId).push(message.author.id);
-
-  const whoisChannel = await client.channels.fetch(whoisChannelId);
-  if (!whoisChannel) return;
-  await whoisChannel.sendSlash(BOT_ID, 'whois discord', message.author.id);
-  console.log(
-    `[Monitor] Sent /whois discord for ${message.author.tag} (${message.author.id}) ` +
-    `in #${message.channel.name} -> whois channel ${whoisChannelId}`
-  );
-});
-
-// Listen for RoVer bot responses globally
-client.on('messageCreate', async (message) => {
-  const whoisChannelIds = Object.values(CHANNEL_MAPPING);
-
+  // 1) Monitor messages in source channels
   if (
-    message.author.id === BOT_ID &&
-    whoisChannelIds.includes(message.channel.id) &&
-    message.embeds &&
-    message.embeds.length > 0 &&
-    message.embeds[0].fields
+    !message.author?.id ||
+    message.author.bot ||
+    blockedUsers.has(message.author.id) ||
+    !MONITOR_CHANNEL_IDS.includes(message.channel.id)
   ) {
-    let robloxUserId = '';
-    let discordIdFromEmbed = '';
+    // continue
+  } else {
+    const discordId = message.author.id;
 
-    for (const field of message.embeds[0].fields) {
-      const name = field.name.toLowerCase();
-      const value = (field.value || '').replace(/`/g, '').trim();
+    // Prevent same Discord user from being queued/logged multiple times
+    if (processedDiscordIds.has(discordId) || inFlightDiscordIds.has(discordId)) return;
 
-      if (name.includes('roblox user id')) {
-        robloxUserId = value;
-      }
-      // RoVer embed often has "Discord User ID" or similar; value can be raw ID or <@123> mention
-      if ((name.includes('discord') && name.includes('id')) || name === 'discord user id') {
-        const extracted = value.replace(/\D/g, '');
-        if (extracted.length >= 17) discordIdFromEmbed = extracted;
-      }
-    }
-
-    if (!robloxUserId) return;
-
-    // Match by Discord ID from embed so we pair the correct user with the correct Roblox data
-    let discordId = discordIdFromEmbed;
-    if (discordId) {
-      const queue = pendingByWhoisChannel.get(message.channel.id) || [];
-      const idx = queue.indexOf(discordId);
-      if (idx !== -1) queue.splice(idx, 1);
-    } else {
-      // Fallback: FIFO (can still mismatch if RoVer responds out of order)
-      const queue = pendingByWhoisChannel.get(message.channel.id) || [];
-      discordId = queue.shift();
-      if (discordId) {
-        console.log(`[Monitor] No Discord ID in RoVer embed, using FIFO fallback for ${discordId}`);
-      }
-    }
-
-    if (!discordId) return;
-
-    const msg = pendingRoblox.get(discordId);
-    if (!msg || processedUsers.has(discordId)) {
-      if (!msg) console.log(`[Monitor] No pending entry for Discord ID ${discordId}, skipping RoVer response`);
+    const whoisChannelId = CHANNEL_MAPPING[message.channel.id];
+    if (!whoisChannelId) {
+      console.log(`[Monitor] No whois channel mapping found for ${message.channel.id}`);
       return;
     }
 
-    // Scrape Rolimons and check value
-    const { value, avatarUrl, rolimonsUrl } = await scrapeRolimons(robloxUserId);
-    console.log(`[Monitor] Scraped value: ${value} for ${msg.discordTag} (${discordId})`);
+    inFlightDiscordIds.add(discordId);
 
-    if (value >= VALUE_THRESHOLD) {
-      if (webhookSent.has(discordId)) {
-        console.log(`[Monitor] Webhook already sent for ${msg.discordTag}, skipping...`);
-        processedUsers.add(discordId);
-        pendingRoblox.delete(discordId);
-        return;
-      }
+    pendingByDiscordId.set(discordId, {
+      discordId,
+      discordTag: message.author.tag,
+      discordTagLower: normTag(message.author.tag),
+      content: message.content,
+      timestamp: message.createdTimestamp,
+      channelId: message.channel.id,
+      channelName: message.channel.name,
+      messageId: message.id,
+      guildId: message.guild?.id,
+      whoisChannelId
+    });
 
-      const jumpToMessageUrl =
-        `https://discord.com/channels/${msg.guildId}/${msg.channelId}/${msg.messageId}`;
+    if (!pendingByWhoisChannel.has(whoisChannelId)) pendingByWhoisChannel.set(whoisChannelId, []);
+    pendingByWhoisChannel.get(whoisChannelId).push({
+      discordId,
+      discordTagLower: normTag(message.author.tag)
+    });
 
-      try {
-        await axios.post(WEBHOOK_URL, {
-          content: '@everyone',
-          embeds: [
-            {
-              title: 'User Message',
-              description:
-                `**Message:** ${msg.content}\n` +
-                `**Discord:** ${msg.discordTag}\n` +
-                `**Channel:** #${msg.channelName}\n` +
-                `[Jump to Message](${jumpToMessageUrl})`,
-              color: 0x00ff00
-            },
-            {
-              title: 'Roblox & Rolimons',
-              description:
-                `**RAP:** ${value.toLocaleString()}\n` +
-                `[Roblox Profile](https://www.roblox.com/users/${robloxUserId}/profile) • ` +
-                `[Rolimons Profile](${rolimonsUrl})`,
-              color: 0x00ff00,
-              thumbnail: { url: avatarUrl }
-            }
-          ]
-        });
+    const whoisChannel = await client.channels.fetch(whoisChannelId);
+    if (!whoisChannel) return;
 
-        processedUsers.add(discordId);
-        webhookSent.add(discordId);
-        pendingRoblox.delete(discordId);
-        console.log(
-          `[Monitor] Sent webhook for ${msg.discordTag} with RAP ${value.toLocaleString()} ` +
-          `from #${msg.channelName}!`
-        );
-      } catch (error) {
-        console.error('Error sending webhook:', error.message);
-        // don't mark as processed on failure
-      }
-    } else {
-      console.log(
-        `[Monitor] User ${msg.discordTag} did not meet value requirement (${value} < ${VALUE_THRESHOLD}).`
-      );
-      processedUsers.add(discordId);
-      pendingRoblox.delete(discordId);
-    }
+    await whoisChannel.sendSlash(BOT_ID, 'whois discord', discordId);
+
+    console.log(
+      `[Monitor] Sent /whois discord for ${message.author.tag} (${discordId}) ` +
+      `in #${message.channel.name} -> whois channel ${whoisChannelId}`
+    );
+
+    return;
+  }
+
+  // 2) Handle RoVer replies in whois channels
+  const whoisChannelIds = new Set(Object.values(CHANNEL_MAPPING));
+
+  if (
+    message.author?.id !== BOT_ID ||
+    !whoisChannelIds.has(message.channel.id) ||
+    !message.embeds ||
+    message.embeds.length === 0
+  ) {
+    return;
+  }
+
+  const embed = message.embeds[0];
+  if (!embed?.fields) return;
+
+  const robloxUserId = extractRobloxUserIdFromEmbed(embed);
+  const discordTagFromEmbed = extractDiscordTagFromEmbed(embed);
+
+  if (!robloxUserId || !discordTagFromEmbed) return;
+
+  const queue = pendingByWhoisChannel.get(message.channel.id) || [];
+  const targetTagLower = normTag(discordTagFromEmbed);
+
+  // Match by discordTag within that whois channel
+  const idx = queue.findIndex(x => x.discordTagLower === targetTagLower);
+  if (idx === -1) {
+    console.log(
+      `[Monitor] RoVer embed tag ${discordTagFromEmbed} not found in pending queue ` +
+      `for whois channel ${message.channel.id}, skipping`
+    );
+    return;
+  }
+
+  const { discordId } = queue.splice(idx, 1)[0];
+  const msg = pendingByDiscordId.get(discordId);
+
+  if (!msg) {
+    console.log(`[Monitor] No pending entry for Discord ID ${discordId}, skipping`);
+    inFlightDiscordIds.delete(discordId);
+    return;
+  }
+
+  if (processedDiscordIds.has(discordId)) {
+    inFlightDiscordIds.delete(discordId);
+    pendingByDiscordId.delete(discordId);
+    return;
+  }
+
+  const { value, avatarUrl, rolimonsUrl } = await scrapeRolimons(robloxUserId);
+  console.log(`[Monitor] Scraped value: ${value} for ${msg.discordTag} (${discordId}) via Roblox ID ${robloxUserId}`);
+
+  if (value < VALUE_THRESHOLD) {
+    console.log(`[Monitor] User ${msg.discordTag} did not meet value requirement (${value} < ${VALUE_THRESHOLD}).`);
+    processedDiscordIds.add(discordId);
+    inFlightDiscordIds.delete(discordId);
+    pendingByDiscordId.delete(discordId);
+    return;
+  }
+
+  if (webhookSent.has(discordId)) {
+    console.log(`[Monitor] Webhook already sent for ${msg.discordTag}, skipping...`);
+    processedDiscordIds.add(discordId);
+    inFlightDiscordIds.delete(discordId);
+    pendingByDiscordId.delete(discordId);
+    return;
+  }
+
+  const jumpToMessageUrl = `https://discord.com/channels/${msg.guildId}/${msg.channelId}/${msg.messageId}`;
+
+  try {
+    await axios.post(WEBHOOK_URL, {
+      content: '@everyone',
+      embeds: [
+        {
+          title: 'User Message',
+          description:
+            `**Message:** ${msg.content}\n` +
+            `**Discord:** ${msg.discordTag}\n` +
+            `**Channel:** #${msg.channelName}\n` +
+            `[Jump to Message](${jumpToMessageUrl})`,
+          color: 0x00ff00
+        },
+        {
+          title: 'Roblox & Rolimons',
+          description:
+            `**RAP:** ${value.toLocaleString()}\n` +
+            `[Roblox Profile](https://www.roblox.com/users/${robloxUserId}/profile) • ` +
+            `[Rolimons Profile](${rolimonsUrl})`,
+          color: 0x00ff00,
+          thumbnail: { url: avatarUrl }
+        }
+      ]
+    });
+
+    webhookSent.add(discordId);
+    processedDiscordIds.add(discordId);
+    console.log(`[Monitor] Sent webhook for ${msg.discordTag} with RAP ${value.toLocaleString()} from #${msg.channelName}!`);
+  } catch (error) {
+    console.error('Error sending webhook:', error.message);
+    // If webhook fails, allow retry later (do not mark processed)
+  } finally {
+    inFlightDiscordIds.delete(discordId);
+    pendingByDiscordId.delete(discordId);
   }
 });
 
-// Error handling
-client.on('error', (error) => {
-  console.error('Discord client error:', error);
-});
-
-process.on('unhandledRejection', (error) => {
-  console.error('Unhandled promise rejection:', error);
-});
-
+client.on('error', (error) => console.error('Discord client error:', error));
+process.on('unhandledRejection', (error) => console.error('Unhandled promise rejection:', error));
 process.on('SIGINT', async () => {
   console.log('Shutting down...');
   process.exit(0);
 });
 
-// Start the bot
 client.login(TOKEN).catch(error => {
   console.error('Failed to login:', error);
   process.exit(1);
