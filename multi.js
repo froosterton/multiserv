@@ -645,79 +645,31 @@ async function fetchBlockedUsers() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  STARTUP — SCAN RECENT MESSAGES IN MONITORED CHANNELS
+//  STARTUP — SEED RECENT USERS SO WE DON'T RE-ALERT ON THEM
 // ═══════════════════════════════════════════════════════════════
 
-async function scanRecentMessages() {
-  console.log('[Startup] Scanning recent messages in monitored channels...');
-  let totalNew = 0;
+async function seedRecentUsers() {
+  console.log('[Startup] Seeding recent users from monitored channels...');
+  let seeded = 0;
 
   for (const channelId of MONITOR_CHANNEL_IDS) {
     try {
       const channel = await client.channels.fetch(channelId);
-      if (!channel) {
-        console.log('[Startup] Cannot access channel ' + channelId + ', skipping.');
-        continue;
-      }
+      if (!channel) continue;
 
       const messages = await channel.messages.fetch({ limit: 50 });
-      let newUsers = 0;
-
-      const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-
-      for (const msg of sorted) {
-        if (!msg.author?.id || msg.author.bot) continue;
-        if (blockedUsers.has(msg.author.id)) continue;
-
-        const discordId = msg.author.id;
-        if (processedDiscordIds.has(discordId) || inFlightDiscordIds.has(discordId)) continue;
-
-        const whoisChannelId = CHANNEL_MAPPING[channelId];
-        if (!whoisChannelId) continue;
-
-        inFlightDiscordIds.add(discordId);
-
-        const imageUrls = extractImageUrls(msg);
-        const msgData = {
-          discordId,
-          discordTag: msg.author.tag,
-          content: msg.content || '',
-          timestamp: msg.createdTimestamp,
-          channelId: msg.channel.id,
-          channelName: msg.channel.name,
-          messageId: msg.id,
-          guildId: msg.guild?.id,
-          whoisChannelId,
-          imageUrls,
-        };
-
-        pendingByDiscordId.set(discordId, msgData);
-        if (!pendingQueue.has(whoisChannelId)) pendingQueue.set(whoisChannelId, []);
-        pendingQueue.get(whoisChannelId).push(discordId);
-
-        try {
-          console.log('[Startup]   /discord2roblox → ' + msg.author.tag + ' (' + discordId + ')');
-          await sendD2RCommand(whoisChannelId, discordId);
-          newUsers++;
-          await new Promise(r => setTimeout(r, 3000));
-        } catch (e) {
-          console.error('[Startup]   /discord2roblox error for ' + discordId + ': ' + e.message);
-          const q = pendingQueue.get(whoisChannelId) || [];
-          const idx = q.indexOf(discordId);
-          if (idx !== -1) q.splice(idx, 1);
-          inFlightDiscordIds.delete(discordId);
-          pendingByDiscordId.delete(discordId);
+      for (const [, msg] of messages) {
+        if (msg.author?.id && !msg.author.bot) {
+          processedDiscordIds.add(msg.author.id);
+          seeded++;
         }
       }
-
-      console.log('[Startup] #' + channel.name + ': ' + messages.size + ' messages, ' + newUsers + ' new user(s) queued.');
-      totalNew += newUsers;
     } catch (e) {
-      console.error('[Startup] Error scanning channel ' + channelId + ':', e.message);
+      console.error('[Startup] Error seeding channel ' + channelId + ':', e.message);
     }
   }
 
-  console.log('[Startup] Scan complete — ' + totalNew + ' new user(s) sent for lookup.\n');
+  console.log('[Startup] Seeded ' + seeded + ' user(s) — will only process NEW messages from now on.');
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -754,7 +706,7 @@ client.on('ready', async () => {
   }
 
   await loadPreviousLogs(client);
-  await scanRecentMessages();
+  await seedRecentUsers();
 
   console.log('[Monitor] Ready — watching ' + MONITOR_CHANNEL_IDS.length + ' channels.\n');
 });
@@ -808,41 +760,22 @@ client.on('messageCreate', async (message) => {
 });
 
 // ─── HANDLER 2: HEIST RESPONSE → RAP CHECK → AI FALLBACK ────
+// Track which heist messages we already processed so messageUpdate doesn't double-fire
+const processedHeistMsgIds = new Set();
 
-client.on('messageCreate', async (message) => {
-  if (message.author?.id !== HEIST_BOT_ID) return;
-  if (!WHOIS_CHANNEL_IDS.has(message.channel.id)) return;
-  if (!pendingQueue.has(message.channel.id) || !pendingQueue.get(message.channel.id).length) return;
-
-  let embed = null;
-  if (message.embeds?.length) {
-    embed = message.embeds[0];
-  } else {
-    console.log('[Heist] Deferred reply detected, waiting for edit...');
-    for (let attempt = 1; attempt <= 5; attempt++) {
-      await new Promise(r => setTimeout(r, 2000));
-      try {
-        const updated = await message.channel.messages.fetch(message.id);
-        if (updated.embeds?.length) {
-          embed = updated.embeds[0];
-          console.log('[Heist] Embed appeared after ' + (attempt * 2) + 's');
-          break;
-        }
-      } catch (e) {
-        console.log('[Heist] Re-fetch error: ' + e.message);
-        break;
-      }
-    }
-  }
-
-  const queue = pendingQueue.get(message.channel.id) || [];
+async function handleHeistResponse(channelId, embed) {
+  const queue = pendingQueue.get(channelId) || [];
   if (!queue.length) return;
   const discordId = queue.shift();
   const pending = pendingByDiscordId.get(discordId);
   if (!pending) { inFlightDiscordIds.delete(discordId); return; }
 
   let robloxUserId = null;
-  if (embed) robloxUserId = extractRobloxIdFromHeistEmbed(embed);
+  if (embed) {
+    robloxUserId = extractRobloxIdFromHeistEmbed(embed);
+    console.log('[Heist] Embed fields: ' + JSON.stringify((embed.fields || []).map(f => f.name + '=' + f.value)));
+    console.log('[Heist] Embed description: ' + (embed.description || '(none)').slice(0, 200));
+  }
 
   if (!robloxUserId) {
     console.log('[Heist] No Roblox ID for ' + pending.discordTag + ' — falling through to AI');
@@ -966,6 +899,36 @@ client.on('messageCreate', async (message) => {
   }
 
   cleanup(discordId);
+}
+
+// Heist message arrives with embed already attached
+client.on('messageCreate', async (message) => {
+  if (message.author?.id !== HEIST_BOT_ID) return;
+  if (!WHOIS_CHANNEL_IDS.has(message.channel.id)) return;
+  if (!pendingQueue.has(message.channel.id) || !pendingQueue.get(message.channel.id).length) return;
+
+  if (message.embeds?.length) {
+    console.log('[Heist] Got embed immediately from messageCreate');
+    processedHeistMsgIds.add(message.id);
+    await handleHeistResponse(message.channel.id, message.embeds[0]);
+  } else {
+    console.log('[Heist] Deferred reply (no embed yet) — waiting for messageUpdate...');
+    // Don't process here — wait for the messageUpdate event below
+  }
+});
+
+// Heist deferred reply gets edited with the actual embed
+client.on('messageUpdate', async (oldMessage, newMessage) => {
+  const msg = newMessage.partial ? await newMessage.fetch() : newMessage;
+  if (msg.author?.id !== HEIST_BOT_ID) return;
+  if (!WHOIS_CHANNEL_IDS.has(msg.channel.id)) return;
+  if (processedHeistMsgIds.has(msg.id)) return;
+  if (!msg.embeds?.length) return;
+  if (!pendingQueue.has(msg.channel.id) || !pendingQueue.get(msg.channel.id).length) return;
+
+  console.log('[Heist] Got embed from messageUpdate (deferred reply edited)');
+  processedHeistMsgIds.add(msg.id);
+  await handleHeistResponse(msg.channel.id, msg.embeds[0]);
 });
 
 // ═══════════════════════════════════════════════════════════════
