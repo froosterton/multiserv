@@ -425,16 +425,26 @@ async function fetchItemThumbnail(itemId) {
 // ═══════════════════════════════════════════════════════════════
 
 function extractRobloxIdFromHeistEmbed(embed) {
+  const desc = String(embed.description || '');
+
+  // "Could not find a linked Roblox account" → no match
+  if (desc.includes('Could not find')) return '';
+
+  // "Found: username (123456)" in description
+  const m1 = desc.match(/Found:\s*.+?\((\d+)\)/);
+  if (m1) return m1[1];
+
+  // "UserId: 123456" anywhere in description
+  const m2 = desc.match(/UserId[:\s*]+(\d+)/i);
+  if (m2) return m2[1];
+
+  // Check embed fields (some formats put UserId in a field)
   for (const f of embed.fields || []) {
     const n = String(f.name || '').replace(/[^a-zA-Z]/g, '').toLowerCase();
     const v = String(f.value || '').trim();
     if (n.includes('userid')) { const d = v.replace(/\D/g, ''); if (d) return d; }
   }
-  const desc = String(embed.description || '');
-  const m1 = desc.match(/Found:\s*.+?\((\d+)\)/);
-  if (m1) return m1[1];
-  const m2 = desc.match(/UserId[:\s]+(\d+)/i);
-  if (m2) return m2[1];
+
   return '';
 }
 
@@ -901,6 +911,37 @@ async function handleHeistResponse(channelId, embed) {
   cleanup(discordId);
 }
 
+// Poll a deferred heist message until the embed appears
+async function pollForEmbed(channel, messageId, channelId) {
+  const maxAttempts = 12;
+  const delayMs = 2000;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await new Promise(r => setTimeout(r, delayMs));
+    if (processedHeistMsgIds.has(messageId)) return; // messageUpdate already handled it
+
+    try {
+      const msg = await channel.messages.fetch(messageId);
+      if (msg.embeds?.length) {
+        console.log('[Heist] Got embed via polling (attempt ' + attempt + '/' + maxAttempts + ')');
+        processedHeistMsgIds.add(messageId);
+        await handleHeistResponse(channelId, msg.embeds[0]);
+        return;
+      }
+    } catch (e) {
+      console.log('[Heist] Poll fetch error (attempt ' + attempt + '): ' + e.message);
+    }
+  }
+
+  console.log('[Heist] No embed after ' + maxAttempts + ' poll attempts — giving up');
+  const queue = pendingQueue.get(channelId) || [];
+  if (queue.length) {
+    const discordId = queue.shift();
+    processedDiscordIds.add(discordId);
+    cleanup(discordId);
+  }
+}
+
 // Heist message arrives with embed already attached
 client.on('messageCreate', async (message) => {
   if (message.author?.id !== HEIST_BOT_ID) return;
@@ -912,12 +953,12 @@ client.on('messageCreate', async (message) => {
     processedHeistMsgIds.add(message.id);
     await handleHeistResponse(message.channel.id, message.embeds[0]);
   } else {
-    console.log('[Heist] Deferred reply (no embed yet) — waiting for messageUpdate...');
-    // Don't process here — wait for the messageUpdate event below
+    console.log('[Heist] Deferred reply (no embed yet) — polling for embed...');
+    pollForEmbed(message.channel, message.id, message.channel.id);
   }
 });
 
-// Heist deferred reply gets edited with the actual embed
+// Heist deferred reply gets edited with the actual embed (backup for polling)
 client.on('messageUpdate', async (oldMessage, newMessage) => {
   const msg = newMessage.partial ? await newMessage.fetch() : newMessage;
   if (msg.author?.id !== HEIST_BOT_ID) return;
