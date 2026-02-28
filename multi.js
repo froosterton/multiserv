@@ -23,11 +23,9 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 const HEIST_BOT_ID = '1225070865935368265';
 
-// Main logs — ALL alerts go here (channel 1465603913217605704)
 const WEBHOOK_MAIN =
   'https://discord.com/api/webhooks/1465603926895235124/Ytb0tM21OCmsqr2TAmkpzd9VxLjP0LApUjkHQBgL_5WHfajsobC2O0CToqbAg13VhLOD';
 
-// Valid logs — only NEW users never logged before (channel 1472280669253144587)
 const WEBHOOK_VALID =
   'https://discord.com/api/webhooks/1472280693680898170/bIvHzC9oCQwVRx-JqPfPxxPcbK_3rqkAJfNt6HHacPhYtreSQLI1RljyiVMtkJqLVKoq';
 
@@ -41,10 +39,8 @@ const MONITOR_CHANNEL_IDS = [
   '749645946719174757', '755810466214707220', '749629644277416048',
 ];
 
-// Guild where /discord2roblox is sent (your private server)
 const COMMAND_GUILD_ID = '1465604866952007815';
 
-// Map each monitored channel → a whois channel in YOUR guild
 const CHANNEL_MAPPING = {
   '907175350348423224':  '1465604933767266422',
   '1391793760354173098': '1465604933767266422',
@@ -61,13 +57,12 @@ const CHANNEL_MAPPING = {
 
 const WHOIS_CHANNEL_IDS = new Set(Object.values(CHANNEL_MAPPING));
 
-// Channels with previous logs — scanned on startup so we never re-alert
 const LOGS_CHANNELS = ['1465603913217605704', '1472280669253144587'];
 
 // ─── GLOBAL STATE ────────────────────────────────────────────
 
-let nameLookup = {};          // normalizedName → { id, data }
-let acronymLookup = {};       // lowercaseAcronym → { id, data }
+let nameLookup = {};
+let acronymLookup = {};
 let lastRolimonsRefresh = 0;
 let geminiModel = null;
 
@@ -75,8 +70,8 @@ let blockedUsers = new Set();
 const processedDiscordIds = new Set();
 const processedRobloxIds = new Set();
 const inFlightDiscordIds = new Set();
-const pendingByDiscordId = new Map();   // discordId → msg payload + promises
-const pendingQueue = new Map();         // whoisChannelId → [discordId, …] (FIFO)
+const pendingByDiscordId = new Map();
+const pendingQueue = new Map();
 
 // ═══════════════════════════════════════════════════════════════
 //  ROLIMONS DATABASE
@@ -111,8 +106,6 @@ function buildLookupTables(itemsDb) {
   nameLookup = nl;
   acronymLookup = al;
   console.log(`[Rolimons] Lookup: ${Object.keys(nl).length} names, ${Object.keys(al).length} acronyms.`);
-
-  // Rebuild blacklist now that we know which acronyms are real items
   rebuildAcronymBlacklist();
 }
 
@@ -133,11 +126,9 @@ async function refreshRolimonsIfNeeded() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  ACRONYM BLACKLIST — runtime-filtered against Rolimons
+//  ACRONYM BLACKLIST
 // ═══════════════════════════════════════════════════════════════
 
-// Base list of common short words that can collide with item acronyms.
-// At runtime, any entry that IS a real Rolimons item acronym is removed.
 const BASE_ACRONYM_BLACKLIST = new Set([
   'mm','dc','w','l','f','op','pc','nvm','pm','dm','rn','gg','bb','gl','ty',
   'np','lf','ft','nft','id','da','fb','sc','rt','ep','hb',
@@ -230,14 +221,17 @@ async function extractItemsFromImage(base64, mime) {
 
 function parseGeminiResponse(raw) {
   let text = raw.trim();
-  if (text.startsWith('```')) {
-    text = text.split('\n').slice(1).join('\n').replace(/```\s*$/, '');
+  var backtickFence = '`' + '`' + '`';
+  if (text.startsWith(backtickFence)) {
+    text = text.split('\n').slice(1).join('\n');
+    var endIdx = text.lastIndexOf(backtickFence);
+    if (endIdx !== -1) text = text.substring(0, endIdx);
   }
   text = text.trim();
 
   let arr;
   try { arr = JSON.parse(text); } catch {
-    console.log(`[Gemini] JSON parse failed: ${raw.slice(0, 200)}`);
+    console.log('[Gemini] JSON parse failed: ' + raw.slice(0, 200));
     return [];
   }
   if (!Array.isArray(arr)) return [];
@@ -261,11 +255,9 @@ function matchSingleItem(detectedName) {
   const norm = normalizeName(detectedName);
   const lower = detectedName.trim().toLowerCase();
 
-  // 1) exact name
   if (nameLookup[norm]) return nameLookup[norm];
-  // 2) exact acronym
   if (acronymLookup[lower]) return acronymLookup[lower];
-  // 3) prefix — detected name is truncated (e.g. "Dominus Formidulos…")
+
   if (norm.split(' ').length >= 2 && norm.length >= 8) {
     let best = null, bestLen = 0;
     for (const [k, v] of Object.entries(nameLookup)) {
@@ -273,8 +265,7 @@ function matchSingleItem(detectedName) {
     }
     if (best) return best;
   }
-  // 4) contains — Gemini added extra text (e.g. "Telamon's Chicken Suit (Chicken)")
-  //    Check if any Rolimons name (2+ words) is contained WITHIN the detected name
+
   if (norm.length >= 8) {
     let best = null, bestLen = 0;
     for (const [k, v] of Object.entries(nameLookup)) {
@@ -292,16 +283,16 @@ function matchItemsRolimonsOnly(detected) {
   for (const det of detected) {
     const m = matchSingleItem(det.name);
     if (!m) {
-      console.log(`[Match]   "${det.name}" → no Rolimons match`);
+      console.log('[Match]   "' + det.name + '" → no Rolimons match');
       continue;
     }
     if (seen.has(m.id)) continue;
     const v = itemValue(m.data);
     if (v < VALUE_THRESHOLD) {
-      console.log(`[Match]   "${det.name}" → ${m.data[0]} = R$ ${v.toLocaleString()} (BELOW ${VALUE_THRESHOLD.toLocaleString()} threshold)`);
+      console.log('[Match]   "' + det.name + '" → ' + m.data[0] + ' = R$ ' + v.toLocaleString() + ' (BELOW ' + VALUE_THRESHOLD.toLocaleString() + ' threshold)');
       continue;
     }
-    console.log(`[Match]   "${det.name}" → ${m.data[0]} = R$ ${v.toLocaleString()} (HIT)`);
+    console.log('[Match]   "' + det.name + '" → ' + m.data[0] + ' = R$ ' + v.toLocaleString() + ' (HIT)');
     results.push({ id: m.id, name: m.data[0], acronym: m.data[1] || '', value: v, detectedAs: det.name });
     seen.add(m.id);
   }
@@ -342,7 +333,7 @@ function findMentionedItems(text) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  IMAGE EXTRACTION FROM DISCORD MESSAGES + FULL ANALYSIS
+//  IMAGE EXTRACTION & ANALYSIS
 // ═══════════════════════════════════════════════════════════════
 
 function extractImageUrls(message) {
@@ -374,11 +365,11 @@ async function analyzeMessageImages(imageUrls) {
       const raw = await extractItemsFromImage(base64, mime);
       const detected = parseGeminiResponse(raw);
       if (detected.length) {
-        console.log(`[Gemini]   Detected: ${detected.map(d => d.name).join(', ')}`);
+        console.log('[Gemini]   Detected: ' + detected.map(d => d.name).join(', '));
         all.push(...matchItemsRolimonsOnly(detected));
       }
     } catch (e) {
-      console.log(`[Gemini]   Image error: ${e.message}`);
+      console.log('[Gemini]   Image error: ' + e.message);
     }
   }
   return all;
@@ -393,7 +384,7 @@ async function fetchRobloxRAP(robloxUserId, logPrefix) {
   try {
     while (true) {
       const { data } = await axios.get(
-        `https://inventory.roblox.com/v1/users/${robloxUserId}/assets/collectibles`,
+        'https://inventory.roblox.com/v1/users/' + robloxUserId + '/assets/collectibles',
         { params: { limit: 100, sortOrder: 'Asc', cursor }, timeout: 5000 },
       );
       pages++;
@@ -402,9 +393,9 @@ async function fetchRobloxRAP(robloxUserId, logPrefix) {
       cursor = data.nextPageCursor;
       if (!cursor) break;
     }
-    console.log(`${logPrefix} RAP=R$ ${rap.toLocaleString()} (${pages} pages)`);
+    console.log(logPrefix + ' RAP=R$ ' + rap.toLocaleString() + ' (' + pages + ' pages)');
   } catch (e) {
-    console.log(`${logPrefix} Roblox API error: ${e.message}`);
+    console.log(logPrefix + ' Roblox API error: ' + e.message);
   }
   return rap;
 }
@@ -434,27 +425,21 @@ async function fetchItemThumbnail(itemId) {
 // ═══════════════════════════════════════════════════════════════
 
 function extractRobloxIdFromHeistEmbed(embed) {
-  // Fields: look for "UserId"
   for (const f of embed.fields || []) {
     const n = String(f.name || '').replace(/[^a-zA-Z]/g, '').toLowerCase();
     const v = String(f.value || '').trim();
     if (n.includes('userid')) { const d = v.replace(/\D/g, ''); if (d) return d; }
   }
   const desc = String(embed.description || '');
-  // "Found: Name (123456)"
   const m1 = desc.match(/Found:\s*.+?\((\d+)\)/);
   if (m1) return m1[1];
-  // "UserId: 123456"
   const m2 = desc.match(/UserId[:\s]+(\d+)/i);
   if (m2) return m2[1];
   return '';
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  RAW SLASH COMMAND — bypasses library permission checks
-//  sendSlash fails because the lib checks USE_APPLICATION_COMMANDS
-//  locally. For user-installed commands Discord itself allows it,
-//  so we POST /interactions directly.
+//  RAW SLASH COMMAND
 // ═══════════════════════════════════════════════════════════════
 
 let d2rCommandId = null;
@@ -464,24 +449,23 @@ async function discoverCommand() {
   console.log('[Heist] Fetching /discord2roblox from heist global commands...');
   try {
     const { data } = await axios.get(
-      `https://discord.com/api/v9/applications/${HEIST_BOT_ID}/commands`,
+      'https://discord.com/api/v9/applications/' + HEIST_BOT_ID + '/commands',
       { headers: { Authorization: TOKEN } },
     );
     const match = data.find(c => c.name === 'discord2roblox');
     if (match) {
       d2rCommandId = match.id;
       d2rCommandVersion = match.version;
-      console.log(`[Heist] Found: id=${d2rCommandId}  version=${d2rCommandVersion}`);
+      console.log('[Heist] Found: id=' + d2rCommandId + '  version=' + d2rCommandVersion);
       return true;
     }
     console.error('[Heist] discord2roblox not in command list!');
   } catch (e) {
-    console.error(`[Heist] API error: ${e.response?.status || e.message}`);
+    console.error('[Heist] API error: ' + (e.response?.status || e.message));
   }
-  // Hardcoded fallback discovered via API 2026-02-14
   d2rCommandId = '1459400420920262782';
   d2rCommandVersion = '1459400421666979985';
-  console.log(`[Heist] Using hardcoded fallback: id=${d2rCommandId}`);
+  console.log('[Heist] Using hardcoded fallback: id=' + d2rCommandId);
   return true;
 }
 
@@ -495,7 +479,6 @@ function generateNonce() {
 async function sendD2RCommand(whoisChannelId, targetUserId) {
   if (!d2rCommandId) throw new Error('discord2roblox command not discovered');
 
-  // Grab session ID from the live WebSocket shard
   let sessionId = '';
   try {
     const shard = client.ws.shards.first();
@@ -528,54 +511,52 @@ async function sendD2RCommand(whoisChannelId, targetUserId) {
 // ═══════════════════════════════════════════════════════════════
 
 async function sendWebhookAlert({ msg, robloxUserId, rap, avatarUrl, geminiItems, textItems }) {
-  const jump = `https://discord.com/channels/${msg.guildId}/${msg.channelId}/${msg.messageId}`;
-  const rolimons = robloxUserId ? `https://www.rolimons.com/player/${robloxUserId}` : '';
+  const jump = 'https://discord.com/channels/' + msg.guildId + '/' + msg.channelId + '/' + msg.messageId;
+  const rolimons = robloxUserId ? 'https://www.rolimons.com/player/' + robloxUserId : '';
 
   const embeds = [
     {
       title: 'User Message',
       description:
-        `**Message:** ${msg.content || '(no text)'}\n` +
-        `**Discord:** <@${msg.discordId}> (${msg.discordTag})\n` +
-        `**Discord ID:** \`${msg.discordId}\`\n` +
-        `**Channel:** #${msg.channelName}\n` +
-        `[Jump to Message](${jump})`,
+        '**Message:** ' + (msg.content || '(no text)') + '\n' +
+        '**Discord:** <@' + msg.discordId + '> (' + msg.discordTag + ')\n' +
+        '**Discord ID:** `' + msg.discordId + '`\n' +
+        '**Channel:** #' + msg.channelName + '\n' +
+        '[Jump to Message](' + jump + ')',
       color: 0x00ff00,
     },
   ];
 
-  // Only add Roblox embed if we have a valid Roblox user ID
   if (robloxUserId) {
     embeds.push({
       title: 'Roblox & Rolimons',
       description:
-        `**RAP:** R$ ${rap.toLocaleString()}\n` +
-        `[Roblox Profile](https://www.roblox.com/users/${robloxUserId}/profile) • ` +
-        `[Rolimons Profile](${rolimons})`,
+        '**RAP:** R$ ' + rap.toLocaleString() + '\n' +
+        '[Roblox Profile](https://www.roblox.com/users/' + robloxUserId + '/profile) • ' +
+        '[Rolimons Profile](' + rolimons + ')',
       color: 0x00ff00,
       ...(avatarUrl ? { thumbnail: { url: avatarUrl } } : {}),
     });
   } else {
     embeds.push({
       title: 'Roblox Lookup',
-      description: '⚠️ Could not resolve Roblox account (heist did not respond)',
+      description: 'Could not resolve Roblox account (heist did not respond)',
       color: 0xFFAA00,
     });
   }
 
-  // Merge and dedupe AI-detected items
   const all = [...(geminiItems || []), ...(textItems || [])];
   const seen = new Set();
   const unique = all.filter(i => { if (seen.has(i.id)) return false; seen.add(i.id); return true; });
 
   if (unique.length) {
-    const bestAi = unique[0]; // already sorted by value desc
+    const bestAi = unique[0];
     const aiThumb = bestAi?.id ? await fetchItemThumbnail(bestAi.id) : '';
     embeds.push({
       title: 'AI-Detected Items',
       description: unique.map(i => {
-        const a = i.acronym ? ` [${i.acronym}]` : '';
-        return `**${i.name}**${a} — R$ ${i.value.toLocaleString()}`;
+        const a = i.acronym ? ' [' + i.acronym + ']' : '';
+        return '**' + i.name + '**' + a + ' — R$ ' + i.value.toLocaleString();
       }).join('\n'),
       color: 0xFF4500,
       ...(aiThumb ? { thumbnail: { url: aiThumb } } : {}),
@@ -584,24 +565,21 @@ async function sendWebhookAlert({ msg, robloxUserId, rap, avatarUrl, geminiItems
 
   const payload = { content: '@everyone', embeds };
 
-  // Send to BOTH webhooks in parallel:
-  //   MAIN  = all logs (persistent record)
-  //   VALID = new unique users only (already guaranteed by dedup logic)
   const results = await Promise.allSettled([
     axios.post(WEBHOOK_MAIN, payload, { timeout: 10000 }),
     axios.post(WEBHOOK_VALID, payload, { timeout: 10000 }),
   ]);
 
   if (results[0].status === 'fulfilled') {
-    console.log(`[Webhook] Main log sent for ${msg.discordTag} (${msg.discordId})`);
+    console.log('[Webhook] Main log sent for ' + msg.discordTag + ' (' + msg.discordId + ')');
   } else {
-    console.error(`[Webhook] Main log error: ${results[0].reason?.message}`);
+    console.error('[Webhook] Main log error: ' + results[0].reason?.message);
   }
 
   if (results[1].status === 'fulfilled') {
-    console.log(`[Webhook] Valid log sent for ${msg.discordTag} (${msg.discordId})`);
+    console.log('[Webhook] Valid log sent for ' + msg.discordTag + ' (' + msg.discordId + ')');
   } else {
-    console.error(`[Webhook] Valid log error: ${results[1].reason?.message}`);
+    console.error('[Webhook] Valid log error: ' + results[1].reason?.message);
   }
 }
 
@@ -615,7 +593,7 @@ async function loadPreviousLogs(cl) {
   for (const chId of LOGS_CHANNELS) {
     try {
       const ch = await cl.channels.fetch(chId);
-      if (!ch) { console.log(`[Startup] Cannot access channel ${chId}, skipping.`); continue; }
+      if (!ch) { console.log('[Startup] Cannot access channel ' + chId + ', skipping.'); continue; }
 
       let lastId = null;
       while (true) {
@@ -645,13 +623,13 @@ async function loadPreviousLogs(cl) {
         if (msgs.size < 100) break;
       }
 
-      console.log(`[Startup] Scanned channel ${chId}`);
+      console.log('[Startup] Scanned channel ' + chId);
     } catch (e) {
-      console.error(`[Startup] Error scanning ${chId}:`, e.message);
+      console.error('[Startup] Error scanning ' + chId + ':', e.message);
     }
   }
 
-  console.log(`[Startup] Previous logs loaded: ${robloxCount} Roblox IDs, ${discordCount} Discord IDs — these users will be skipped.`);
+  console.log('[Startup] Previous logs loaded: ' + robloxCount + ' Roblox IDs, ' + discordCount + ' Discord IDs — these users will be skipped.');
 }
 
 async function fetchBlockedUsers() {
@@ -660,10 +638,86 @@ async function fetchBlockedUsers() {
       headers: { Authorization: TOKEN },
     });
     blockedUsers = new Set(res.data.filter(u => u.type === 2).map(u => u.id));
-    console.log(`[Startup] Blocked users: ${blockedUsers.size}`);
+    console.log('[Startup] Blocked users: ' + blockedUsers.size);
   } catch (e) {
     console.error('[Startup] Blocked users error:', e.message);
   }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  STARTUP — SCAN RECENT MESSAGES IN MONITORED CHANNELS
+// ═══════════════════════════════════════════════════════════════
+
+async function scanRecentMessages() {
+  console.log('[Startup] Scanning recent messages in monitored channels...');
+  let totalNew = 0;
+
+  for (const channelId of MONITOR_CHANNEL_IDS) {
+    try {
+      const channel = await client.channels.fetch(channelId);
+      if (!channel) {
+        console.log('[Startup] Cannot access channel ' + channelId + ', skipping.');
+        continue;
+      }
+
+      const messages = await channel.messages.fetch({ limit: 50 });
+      let newUsers = 0;
+
+      const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+      for (const msg of sorted) {
+        if (!msg.author?.id || msg.author.bot) continue;
+        if (blockedUsers.has(msg.author.id)) continue;
+
+        const discordId = msg.author.id;
+        if (processedDiscordIds.has(discordId) || inFlightDiscordIds.has(discordId)) continue;
+
+        const whoisChannelId = CHANNEL_MAPPING[channelId];
+        if (!whoisChannelId) continue;
+
+        inFlightDiscordIds.add(discordId);
+
+        const imageUrls = extractImageUrls(msg);
+        const msgData = {
+          discordId,
+          discordTag: msg.author.tag,
+          content: msg.content || '',
+          timestamp: msg.createdTimestamp,
+          channelId: msg.channel.id,
+          channelName: msg.channel.name,
+          messageId: msg.id,
+          guildId: msg.guild?.id,
+          whoisChannelId,
+          imageUrls,
+        };
+
+        pendingByDiscordId.set(discordId, msgData);
+        if (!pendingQueue.has(whoisChannelId)) pendingQueue.set(whoisChannelId, []);
+        pendingQueue.get(whoisChannelId).push(discordId);
+
+        try {
+          console.log('[Startup]   /discord2roblox → ' + msg.author.tag + ' (' + discordId + ')');
+          await sendD2RCommand(whoisChannelId, discordId);
+          newUsers++;
+          await new Promise(r => setTimeout(r, 3000));
+        } catch (e) {
+          console.error('[Startup]   /discord2roblox error for ' + discordId + ': ' + e.message);
+          const q = pendingQueue.get(whoisChannelId) || [];
+          const idx = q.indexOf(discordId);
+          if (idx !== -1) q.splice(idx, 1);
+          inFlightDiscordIds.delete(discordId);
+          pendingByDiscordId.delete(discordId);
+        }
+      }
+
+      console.log('[Startup] #' + channel.name + ': ' + messages.size + ' messages, ' + newUsers + ' new user(s) queued.');
+      totalNew += newUsers;
+    } catch (e) {
+      console.error('[Startup] Error scanning channel ' + channelId + ':', e.message);
+    }
+  }
+
+  console.log('[Startup] Scan complete — ' + totalNew + ' new user(s) sent for lookup.\n');
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -680,7 +734,7 @@ function cleanup(discordId) {
 // ─── READY ───────────────────────────────────────────────────
 
 client.on('ready', async () => {
-  console.log(`[Monitor] Logged in as ${client.user.tag}`);
+  console.log('[Monitor] Logged in as ' + client.user.tag);
 
   await fetchBlockedUsers();
   initGemini();
@@ -694,15 +748,15 @@ client.on('ready', async () => {
     process.exit(1);
   }
 
-  // Discover /discord2roblox command ID (needed for raw API calls)
   const cmdFound = await discoverCommand();
   if (!cmdFound) {
     console.error('[Startup] WARNING: /discord2roblox not found — Roblox lookups will fail!');
   }
 
   await loadPreviousLogs(client);
+  await scanRecentMessages();
 
-  console.log(`[Monitor] Ready — watching ${MONITOR_CHANNEL_IDS.length} channels.\n`);
+  console.log('[Monitor] Ready — watching ' + MONITOR_CHANNEL_IDS.length + ' channels.\n');
 });
 
 // ─── HANDLER 1: SOURCE CHANNEL MESSAGES ──────────────────────
@@ -725,9 +779,8 @@ client.on('messageCreate', async (message) => {
   const content = message.content || '';
   const imageUrls = extractImageUrls(message);
 
-  console.log(`\n[Monitor] ${discordTag} (${discordId}) in #${message.channel.name}`);
+  console.log('\n[Monitor] ' + discordTag + ' (' + discordId + ') in #' + message.channel.name);
 
-  // Save message data for later use
   const msgData = {
     discordId, discordTag, content,
     timestamp: message.createdTimestamp,
@@ -743,45 +796,40 @@ client.on('messageCreate', async (message) => {
   if (!pendingQueue.has(whoisChannelId)) pendingQueue.set(whoisChannelId, []);
   pendingQueue.get(whoisChannelId).push(discordId);
 
-  // ── STEP 1: Send /discord2roblox ──
   try {
-    console.log(`[Monitor]   /discord2roblox → ${discordTag} (whois: ${whoisChannelId})`);
+    console.log('[Monitor]   /discord2roblox → ' + discordTag + ' (whois: ' + whoisChannelId + ')');
     await sendD2RCommand(whoisChannelId, discordId);
   } catch (e) {
-    console.error(`[Monitor]   /discord2roblox error: ${e.response?.data?.message || e.message}`);
+    console.error('[Monitor]   /discord2roblox error: ' + (e.response?.data?.message || e.message));
     const q = pendingQueue.get(whoisChannelId) || [];
     const idx = q.indexOf(discordId);
     if (idx !== -1) q.splice(idx, 1);
-    // heist failed — fall through to AI fallback below
   }
 });
 
 // ─── HANDLER 2: HEIST RESPONSE → RAP CHECK → AI FALLBACK ────
-// Heist sends a deferred reply (embeds=0) then edits it.
-// We detect the empty message and re-fetch after a delay.
 
 client.on('messageCreate', async (message) => {
   if (message.author?.id !== HEIST_BOT_ID) return;
   if (!WHOIS_CHANNEL_IDS.has(message.channel.id)) return;
   if (!pendingQueue.has(message.channel.id) || !pendingQueue.get(message.channel.id).length) return;
 
-  // ── Wait for embed (heist deferred reply) ──
   let embed = null;
   if (message.embeds?.length) {
     embed = message.embeds[0];
   } else {
-    console.log(`[Heist] Deferred reply detected, waiting for edit...`);
+    console.log('[Heist] Deferred reply detected, waiting for edit...');
     for (let attempt = 1; attempt <= 5; attempt++) {
       await new Promise(r => setTimeout(r, 2000));
       try {
         const updated = await message.channel.messages.fetch(message.id);
         if (updated.embeds?.length) {
           embed = updated.embeds[0];
-          console.log(`[Heist] Embed appeared after ${attempt * 2}s`);
+          console.log('[Heist] Embed appeared after ' + (attempt * 2) + 's');
           break;
         }
       } catch (e) {
-        console.log(`[Heist] Re-fetch error: ${e.message}`);
+        console.log('[Heist] Re-fetch error: ' + e.message);
         break;
       }
     }
@@ -793,32 +841,29 @@ client.on('messageCreate', async (message) => {
   const pending = pendingByDiscordId.get(discordId);
   if (!pending) { inFlightDiscordIds.delete(discordId); return; }
 
-  // ── Extract Roblox user ID ──
   let robloxUserId = null;
   if (embed) robloxUserId = extractRobloxIdFromHeistEmbed(embed);
 
   if (!robloxUserId) {
-    console.log(`[Heist] No Roblox ID for ${pending.discordTag} — falling through to AI`);
+    console.log('[Heist] No Roblox ID for ' + pending.discordTag + ' — falling through to AI');
   } else {
-    console.log(`[Heist] ${pending.discordTag} → Roblox ${robloxUserId}`);
+    console.log('[Heist] ' + pending.discordTag + ' → Roblox ' + robloxUserId);
 
-    // Already logged?
     if (processedRobloxIds.has(robloxUserId)) {
-      console.log(`[Heist] Roblox ${robloxUserId} previously logged — skipping`);
+      console.log('[Heist] Roblox ' + robloxUserId + ' previously logged — skipping');
       processedDiscordIds.add(discordId);
       cleanup(discordId);
       return;
     }
 
-    // ── STEP 2: RAP check ──
-    const lp = `[Check][${pending.discordTag}][Roblox ${robloxUserId}]`;
+    const lp = '[Check][' + pending.discordTag + '][Roblox ' + robloxUserId + ']';
     const [rap, avatarUrl] = await Promise.all([
       fetchRobloxRAP(robloxUserId, lp),
       fetchRobloxAvatar(robloxUserId),
     ]);
 
     if (rap >= VALUE_THRESHOLD) {
-      console.log(`${lp} RAP HIT → R$ ${rap.toLocaleString()} — sending to BOTH webhooks`);
+      console.log(lp + ' RAP HIT → R$ ' + rap.toLocaleString() + ' — sending to BOTH webhooks');
       await sendWebhookAlert({
         msg: pending, robloxUserId, rap, avatarUrl,
         geminiItems: [], textItems: [],
@@ -829,15 +874,12 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    console.log(`${lp} RAP below threshold (R$ ${rap.toLocaleString()}) — checking AI fallback...`);
+    console.log(lp + ' RAP below threshold (R$ ' + rap.toLocaleString() + ') — checking AI fallback...');
   }
 
-  // ── STEP 3: AI FALLBACK (RAP < 100k OR heist didn't return Roblox ID) ──
-  // Only runs if the user's RAP wasn't enough on its own
   const imageUrls = pending.imageUrls || [];
   const textContent = pending.content || '';
 
-  // Skip AI fallback for obvious buyer/spam posts — these aren't sellers
   const textLower = textContent.toLowerCase();
   const BUYER_KEYWORDS = [
     'buying your', 'i buy', 'we buy', 'dm me with',
@@ -845,7 +887,7 @@ client.on('messageCreate', async (message) => {
     'buying all', 'buying any', 'i purchase',
   ];
   if (BUYER_KEYWORDS.some(kw => textLower.includes(kw))) {
-    console.log(`[AI Fallback] Skipped ${pending.discordTag} — buyer/spam post detected`);
+    console.log('[AI Fallback] Skipped ' + pending.discordTag + ' — buyer/spam post detected');
     processedDiscordIds.add(discordId);
     if (robloxUserId) processedRobloxIds.add(robloxUserId);
     cleanup(discordId);
@@ -854,11 +896,11 @@ client.on('messageCreate', async (message) => {
 
   let geminiItems = [];
   if (imageUrls.length) {
-    console.log(`[AI Fallback] Analyzing ${imageUrls.length} image(s) for ${pending.discordTag}...`);
+    console.log('[AI Fallback] Analyzing ' + imageUrls.length + ' image(s) for ' + pending.discordTag + '...');
     try {
       geminiItems = await analyzeMessageImages(imageUrls);
     } catch (e) {
-      console.log(`[AI Fallback] Gemini error: ${e.message}`);
+      console.log('[AI Fallback] Gemini error: ' + e.message);
     }
   }
 
@@ -869,35 +911,32 @@ client.on('messageCreate', async (message) => {
   }
 
   if (geminiItems.length > 0 || textItems.length > 0) {
-    // Check dedup again
     if (processedDiscordIds.has(discordId)) { cleanup(discordId); return; }
 
     const allItems = [...geminiItems, ...textItems];
-    const itemNames = allItems.map(i => `${i.name} (R$ ${i.value.toLocaleString()})`).join(', ');
-    console.log(`[AI Fallback] HIT for ${pending.discordTag} → ${itemNames} — sending to VALID webhook`);
+    const itemNames = allItems.map(i => i.name + ' (R$ ' + i.value.toLocaleString() + ')').join(', ');
+    console.log('[AI Fallback] HIT for ' + pending.discordTag + ' → ' + itemNames + ' — sending to VALID webhook');
 
-    // Fetch thumbnail for the highest-value item
     const bestItem = allItems.sort((a, b) => b.value - a.value)[0];
     const thumbUrl = bestItem?.id ? await fetchItemThumbnail(bestItem.id) : '';
 
-    // AI fallback alerts go to VALID webhook only
-    const jump = `https://discord.com/channels/${pending.guildId}/${pending.channelId}/${pending.messageId}`;
+    const jump = 'https://discord.com/channels/' + pending.guildId + '/' + pending.channelId + '/' + pending.messageId;
     const embeds = [
       {
         title: 'AI-Detected High-Value Items',
         description:
-          `**Discord:** <@${pending.discordId}> (${pending.discordTag})\n` +
-          `**Discord ID:** \`${pending.discordId}\`\n` +
-          `**Channel:** #${pending.channelName}\n` +
-          `[Jump to Message](${jump})`,
+          '**Discord:** <@' + pending.discordId + '> (' + pending.discordTag + ')\n' +
+          '**Discord ID:** `' + pending.discordId + '`\n' +
+          '**Channel:** #' + pending.channelName + '\n' +
+          '[Jump to Message](' + jump + ')',
         color: 0xFF4500,
         ...(thumbUrl ? { thumbnail: { url: thumbUrl } } : {}),
       },
       {
         title: 'Detected Items',
         description: allItems.map(i => {
-          const a = i.acronym ? ` [${i.acronym}]` : '';
-          return `**${i.name}**${a} — R$ ${i.value.toLocaleString()}`;
+          const a = i.acronym ? ' [' + i.acronym + ']' : '';
+          return '**' + i.name + '**' + a + ' — R$ ' + i.value.toLocaleString();
         }).join('\n'),
         color: 0xFF4500,
       },
@@ -906,22 +945,22 @@ client.on('messageCreate', async (message) => {
     if (robloxUserId) {
       embeds.splice(1, 0, {
         title: 'Roblox (below RAP threshold)',
-        description: `[Roblox Profile](https://www.roblox.com/users/${robloxUserId}/profile) • [Rolimons](https://www.rolimons.com/player/${robloxUserId})`,
+        description: '[Roblox Profile](https://www.roblox.com/users/' + robloxUserId + '/profile) • [Rolimons](https://www.rolimons.com/player/' + robloxUserId + ')',
         color: 0xFFAA00,
       });
     }
 
     try {
       await axios.post(WEBHOOK_VALID, { content: '@everyone', embeds }, { timeout: 10000 });
-      console.log(`[AI Fallback] Sent to VALID webhook for ${pending.discordTag}`);
+      console.log('[AI Fallback] Sent to VALID webhook for ' + pending.discordTag);
     } catch (e) {
-      console.error(`[AI Fallback] Webhook error: ${e.message}`);
+      console.error('[AI Fallback] Webhook error: ' + e.message);
     }
 
     processedDiscordIds.add(discordId);
     if (robloxUserId) processedRobloxIds.add(robloxUserId);
   } else {
-    console.log(`[AI Fallback] No high-value items found for ${pending.discordTag} — skipping`);
+    console.log('[AI Fallback] No high-value items found for ' + pending.discordTag + ' — skipping');
     processedDiscordIds.add(discordId);
     if (robloxUserId) processedRobloxIds.add(robloxUserId);
   }
