@@ -7,7 +7,7 @@
 //   - Gemini Vision AI to analyze posted images for limiteds
 //   - Rolimons database for item identification & valuation
 //   - Roblox inventory API for total RAP
-//   - /discord2roblox (heist) to link Discord → Roblox
+//   - Rover /whois discord + Bloxlink /getinfo discord_user (dual-command)
 //
 // npm install discord.js-selfbot-v13 axios @google/generative-ai
 // ═══════════════════════════════════════════════════════════════
@@ -21,7 +21,9 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const TOKEN = process.env.DISCORD_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-const HEIST_BOT_ID = '1225070865935368265';
+const ROVER_BOT_ID = '298796807323123712';
+const BLOXLINK_BOT_ID = '426537812993638400';
+const BLOXLINK_CHANNEL_ID = '1471499501461176464';
 
 const WEBHOOK_MAIN =
   'https://discord.com/api/webhooks/1465603926895235124/Ytb0tM21OCmsqr2TAmkpzd9VxLjP0LApUjkHQBgL_5WHfajsobC2O0CToqbAg13VhLOD';
@@ -55,12 +57,9 @@ const CHANNEL_MAPPING = {
   '749629644277416048': '1465604867824291905',
 };
 
-const WHOIS_CHANNEL_IDS = new Set(Object.values(CHANNEL_MAPPING));
+const WHOIS_CHANNEL_IDS = new Set([...Object.values(CHANNEL_MAPPING), BLOXLINK_CHANNEL_ID]);
 
 const LOGS_CHANNELS = ['1465603913217605704', '1472280669253144587'];
-
-// Set to true to log raw gateway events when heist sends/edits — helps debug embed detection
-const DEBUG_HEIST_EMBED = true;
 
 // ─── GLOBAL STATE ────────────────────────────────────────────
 
@@ -74,7 +73,12 @@ const processedDiscordIds = new Set();
 const processedRobloxIds = new Set();
 const inFlightDiscordIds = new Set();
 const pendingByDiscordId = new Map();
-const pendingQueue = new Map();
+const pendingQueueRover = new Map();
+const pendingQueueBloxlink = [];
+const processedBotMessages = new Set();
+
+let roverWhoisCmd = null;
+let bloxlinkGetinfoCmd = null;
 
 // ═══════════════════════════════════════════════════════════════
 //  ROLIMONS DATABASE
@@ -424,98 +428,118 @@ async function fetchItemThumbnail(itemId) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  HEIST EMBED PARSING
+//  ROVER / BLOXLINK EMBED EXTRACTION
 // ═══════════════════════════════════════════════════════════════
 
-function extractRobloxIdFromHeistEmbed(embed) {
-  const desc = String(embed.description || '');
-
-  // "Could not find a linked Roblox account" → no match
-  if (desc.includes('Could not find')) return '';
-
-  // "Found: username (123456)" in description
-  const m1 = desc.match(/Found:\s*.+?\((\d+)\)/);
-  if (m1) return m1[1];
-
-  // "UserId: 123456" anywhere in description
-  const m2 = desc.match(/UserId[:\s*]+(\d+)/i);
-  if (m2) return m2[1];
-
-  // Check embed fields (some formats put UserId in a field)
-  for (const f of embed.fields || []) {
-    const n = String(f.name || '').replace(/[^a-zA-Z]/g, '').toLowerCase();
-    const v = String(f.value || '').trim();
-    if (n.includes('userid')) { const d = v.replace(/\D/g, ''); if (d) return d; }
-  }
-
-  return '';
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  RAW SLASH COMMAND
-// ═══════════════════════════════════════════════════════════════
-
-let d2rCommandId = null;
-let d2rCommandVersion = null;
-
-async function discoverCommand() {
-  console.log('[Heist] Fetching /discord2roblox from heist global commands...');
-  try {
-    const { data } = await axios.get(
-      'https://discord.com/api/v9/applications/' + HEIST_BOT_ID + '/commands',
-      { headers: { Authorization: TOKEN } },
-    );
-    const match = data.find(c => c.name === 'discord2roblox');
-    if (match) {
-      d2rCommandId = match.id;
-      d2rCommandVersion = match.version;
-      console.log('[Heist] Found: id=' + d2rCommandId + '  version=' + d2rCommandVersion);
-      return true;
+function extractFromEmbeds(message) {
+  const embeds = message.embeds || [];
+  if (embeds.length === 0) return null;
+  for (const embed of embeds) {
+    if (embed.fields) {
+      for (const field of embed.fields) {
+        if (field.name.toLowerCase().includes('roblox user id')) {
+          const id = field.value.replace(/[`\s]/g, '').trim();
+          if (/^\d+$/.test(id)) return id;
+        }
+      }
     }
-    console.error('[Heist] discord2roblox not in command list!');
-  } catch (e) {
-    console.error('[Heist] API error: ' + (e.response?.status || e.message));
+    if (embed.title) {
+      const m = embed.title.match(/\((\d+)\)/);
+      if (m) return m[1];
+    }
+    if (embed.url) {
+      const m = embed.url.match(/roblox\.com\/users\/(\d+)/);
+      if (m) return m[1];
+    }
   }
-  d2rCommandId = '1459400420920262782';
-  d2rCommandVersion = '1459400421666979985';
-  console.log('[Heist] Using hardcoded fallback: id=' + d2rCommandId);
-  return true;
+  return null;
 }
+
+function extractFromComponentsV2(rawComponents) {
+  if (!rawComponents || !Array.isArray(rawComponents)) return null;
+  function searchComponents(components) {
+    for (const comp of components) {
+      if (comp.type === 10 && comp.content) {
+        const urlMatch = comp.content.match(/roblox\.com\/users\/(\d+)/);
+        if (urlMatch) return urlMatch[1];
+        const idMatch = comp.content.match(/\((\d+)\)/);
+        if (idMatch && idMatch[1].length >= 5) return idMatch[1];
+      }
+      if (comp.components) {
+        const found = searchComponents(comp.components);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+  return searchComponents(rawComponents);
+}
+
+async function fetchRawMessages(channelId, limit = 5) {
+  const res = await axios.get(
+    'https://discord.com/api/v9/channels/' + channelId + '/messages?limit=' + limit,
+    { headers: { Authorization: TOKEN }, timeout: 5000 }
+  );
+  return res.data || [];
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ROVER /whois + BLOXLINK /getinfo COMMANDS
+// ═══════════════════════════════════════════════════════════════
 
 function generateNonce() {
-  return String(
-    (BigInt(Date.now() - 1420070400000) << 22n) |
-    BigInt(Math.floor(Math.random() * 4194304)),
-  );
+  return String(BigInt(Date.now() - 1420070400000) << 22n | BigInt(Math.floor(Math.random() * 4194304)));
 }
 
-async function sendD2RCommand(whoisChannelId, targetUserId) {
-  if (!d2rCommandId) throw new Error('discord2roblox command not discovered');
-
-  let sessionId = '';
-  try {
-    const shard = client.ws.shards.first();
-    sessionId = shard?.sessionId || shard?.session_id || '';
-  } catch { /* fallback empty */ }
-
+async function sendRoverWhois(channelId, userId) {
+  if (!roverWhoisCmd) throw new Error('Rover /whois command not loaded');
+  const sessionId = client.ws?.shards?.first()?.sessionId || '';
   await axios.post(
     'https://discord.com/api/v9/interactions',
     {
       type: 2,
-      application_id: HEIST_BOT_ID,
+      application_id: ROVER_BOT_ID,
       guild_id: COMMAND_GUILD_ID,
-      channel_id: whoisChannelId,
+      channel_id: channelId,
       session_id: sessionId,
       data: {
-        version: d2rCommandVersion,
-        id: d2rCommandId,
-        name: 'discord2roblox',
+        version: roverWhoisCmd.version,
+        id: roverWhoisCmd.id,
+        name: 'whois',
         type: 1,
-        options: [{ type: 6, name: 'user', value: targetUserId }],
+        options: [{
+          type: 1,
+          name: 'discord',
+          options: [{ type: 6, name: 'user', value: userId }]
+        }]
       },
-      nonce: generateNonce(),
+      nonce: generateNonce()
     },
-    { headers: { Authorization: TOKEN, 'Content-Type': 'application/json' } },
+    { headers: { Authorization: TOKEN, 'Content-Type': 'application/json' } }
+  );
+}
+
+async function sendBloxlinkGetinfo(channelId, userId) {
+  if (!bloxlinkGetinfoCmd) throw new Error('Bloxlink /getinfo command not loaded');
+  const sessionId = client.ws?.shards?.first()?.sessionId || '';
+  await axios.post(
+    'https://discord.com/api/v9/interactions',
+    {
+      type: 2,
+      application_id: BLOXLINK_BOT_ID,
+      guild_id: COMMAND_GUILD_ID,
+      channel_id: channelId,
+      session_id: sessionId,
+      data: {
+        version: bloxlinkGetinfoCmd.version,
+        id: bloxlinkGetinfoCmd.id,
+        name: 'getinfo',
+        type: 1,
+        options: [{ type: 6, name: 'discord_user', value: userId }]
+      },
+      nonce: generateNonce()
+    },
+    { headers: { Authorization: TOKEN, 'Content-Type': 'application/json' } }
   );
 }
 
@@ -713,9 +737,18 @@ client.on('ready', async () => {
     process.exit(1);
   }
 
-  const cmdFound = await discoverCommand();
-  if (!cmdFound) {
-    console.error('[Startup] WARNING: /discord2roblox not found — Roblox lookups will fail!');
+  console.log('[Monitor] Fetching guild command index...');
+  try {
+    const { data } = await axios.get(
+      'https://discord.com/api/v9/guilds/' + COMMAND_GUILD_ID + '/application-command-index',
+      { headers: { Authorization: TOKEN } }
+    );
+    roverWhoisCmd = data.application_commands?.find(c => c.name === 'whois' && c.application_id === ROVER_BOT_ID);
+    bloxlinkGetinfoCmd = data.application_commands?.find(c => c.name === 'getinfo' && c.application_id === BLOXLINK_BOT_ID);
+    console.log('[Monitor] Rover /whois: ' + (roverWhoisCmd ? 'LOADED' : 'NOT FOUND'));
+    console.log('[Monitor] Bloxlink /getinfo: ' + (bloxlinkGetinfoCmd ? 'LOADED' : 'NOT FOUND'));
+  } catch (e) {
+    console.error('[Startup] Command index failed:', e.message);
   }
 
   await loadPreviousLogs(client);
@@ -757,304 +790,192 @@ client.on('messageCreate', async (message) => {
     imageUrls,
   };
 
-  pendingByDiscordId.set(discordId, msgData);
-  if (!pendingQueue.has(whoisChannelId)) pendingQueue.set(whoisChannelId, []);
-  pendingQueue.get(whoisChannelId).push(discordId);
+  pendingByDiscordId.set(discordId, {
+    ...msgData,
+    phase: 'whois',
+    whoisRobloxId: null,
+    getinfoRobloxId: null,
+  });
+
+  if (!pendingQueueRover.has(whoisChannelId)) pendingQueueRover.set(whoisChannelId, []);
+  pendingQueueRover.get(whoisChannelId).push(discordId);
 
   try {
-    console.log('[Monitor]   /discord2roblox → ' + discordTag + ' (whois: ' + whoisChannelId + ')');
-    await sendD2RCommand(whoisChannelId, discordId);
+    console.log('[Monitor]   /whois discord → ' + discordTag + ' (whois: ' + whoisChannelId + ')');
+    await sendRoverWhois(whoisChannelId, discordId);
   } catch (e) {
-    console.error('[Monitor]   /discord2roblox error: ' + (e.response?.data?.message || e.message));
-    const q = pendingQueue.get(whoisChannelId) || [];
+    console.error('[Monitor]   /whois error: ' + (e.response?.data?.message || e.message));
+    const q = pendingQueueRover.get(whoisChannelId) || [];
     const idx = q.indexOf(discordId);
     if (idx !== -1) q.splice(idx, 1);
+    cleanup(discordId);
   }
 });
 
-// ─── HANDLER 2: HEIST RESPONSE → RAP CHECK → AI FALLBACK ────
-// Track which heist messages we already processed so messageUpdate doesn't double-fire
-const processedHeistMsgIds = new Set();
+// ─── HANDLER 2: ROVER + BLOXLINK RESPONSES → DUAL-COMMAND FLOW ────
 
-async function handleHeistResponse(channelId, embed) {
-  const queue = pendingQueue.get(channelId) || [];
-  if (!queue.length) return;
-  const discordId = queue.shift();
-  const pending = pendingByDiscordId.get(discordId);
-  if (!pending) { inFlightDiscordIds.delete(discordId); return; }
+async function handleBotResponse(message, isUpdate) {
+  const watchedChannels = [...Object.values(CHANNEL_MAPPING), BLOXLINK_CHANNEL_ID];
+  if (!watchedChannels.includes(message.channel.id)) return;
+  if (message.author.id !== ROVER_BOT_ID && message.author.id !== BLOXLINK_BOT_ID) return;
+  if (processedBotMessages.has(message.id)) return;
 
-  let robloxUserId = null;
-  if (embed) {
-    robloxUserId = extractRobloxIdFromHeistEmbed(embed);
-    console.log('[Heist] Embed fields: ' + JSON.stringify((embed.fields || []).map(f => f.name + '=' + f.value)));
-    console.log('[Heist] Embed description: ' + (embed.description || '(none)').slice(0, 200));
+  const isRover = message.author.id === ROVER_BOT_ID;
+  const channelId = message.channel.id;
+
+  let discordId = null;
+  if (isRover) {
+    const queue = pendingQueueRover.get(channelId) || [];
+    if (!queue.length) return;
+    discordId = queue.shift();
+  } else {
+    if (!pendingQueueBloxlink.length) return;
+    discordId = pendingQueueBloxlink.shift();
   }
 
-  if (!robloxUserId) {
-    console.log('[Heist] No Roblox ID for ' + pending.discordTag + ' — falling through to AI');
-  } else {
-    console.log('[Heist] ' + pending.discordTag + ' → Roblox ' + robloxUserId);
+  const pending = pendingByDiscordId.get(discordId);
+  if (!pending) return;
 
+  let robloxUserId = null;
+  if (isRover) {
+    robloxUserId = extractFromEmbeds(message);
+    if (!robloxUserId && isUpdate) {
+      await new Promise(r => setTimeout(r, 500));
+      const rawMsgs = await fetchRawMessages(channelId, 3);
+      const raw = rawMsgs.find(m => m.id === message.id);
+      if (raw) {
+        robloxUserId = extractFromEmbeds({ embeds: raw.embeds || [] }) || extractFromComponentsV2(raw.components);
+      }
+    }
+  } else {
+    if (!isUpdate) return;
+    await new Promise(r => setTimeout(r, 1000));
+    const rawMsgs = await fetchRawMessages(BLOXLINK_CHANNEL_ID, 3);
+    const raw = rawMsgs.find(m => m.id === message.id);
+    if (raw) {
+      robloxUserId = extractFromComponentsV2(raw.components);
+    }
+  }
+
+  processedBotMessages.add(message.id);
+
+  if (isRover) {
+    if (!robloxUserId) {
+      console.log('[Rover] No Roblox ID for ' + pending.discordTag + ' — trying /getinfo');
+      pending.phase = 'getinfo_after_whois_none';
+      pendingQueueBloxlink.push(discordId);
+      try {
+        await sendBloxlinkGetinfo(BLOXLINK_CHANNEL_ID, discordId);
+        console.log('[Monitor]   /getinfo discord_user → ' + pending.discordTag);
+      } catch (e) {
+        console.error('[Monitor]   /getinfo error:', e.message);
+        processedDiscordIds.add(discordId);
+        cleanup(discordId);
+      }
+      return;
+    }
+
+    pending.whoisRobloxId = robloxUserId;
     if (processedRobloxIds.has(robloxUserId)) {
-      console.log('[Heist] Roblox ' + robloxUserId + ' previously logged — skipping');
+      console.log('[Rover] Roblox ' + robloxUserId + ' previously logged — skipping');
       processedDiscordIds.add(discordId);
       cleanup(discordId);
       return;
     }
-
-    const lp = '[Check][' + pending.discordTag + '][Roblox ' + robloxUserId + ']';
+    const lp = '[Rover][' + pending.discordTag + '][Roblox ' + robloxUserId + ']';
     const [rap, avatarUrl] = await Promise.all([
       fetchRobloxRAP(robloxUserId, lp),
       fetchRobloxAvatar(robloxUserId),
     ]);
 
     if (rap >= VALUE_THRESHOLD) {
-      console.log(lp + ' RAP HIT → R$ ' + rap.toLocaleString() + ' — sending to BOTH webhooks');
-      await sendWebhookAlert({
-        msg: pending, robloxUserId, rap, avatarUrl,
-        geminiItems: [], textItems: [],
-      });
+      console.log(lp + ' RAP HIT → R$ ' + rap.toLocaleString());
+      await sendWebhookAlert({ msg: pending, robloxUserId, rap, avatarUrl, geminiItems: [], textItems: [] });
       processedDiscordIds.add(discordId);
       processedRobloxIds.add(robloxUserId);
       cleanup(discordId);
       return;
     }
 
-    console.log(lp + ' RAP below threshold (R$ ' + rap.toLocaleString() + ') — checking AI fallback...');
+    if (pending.phase === 'whois_after_getinfo_low') {
+      console.log(lp + ' RAP below threshold (vice versa) — skipping');
+      processedDiscordIds.add(discordId);
+      processedRobloxIds.add(robloxUserId);
+      cleanup(discordId);
+      return;
+    }
+
+    console.log(lp + ' RAP below threshold — trying /getinfo');
+    pending.phase = 'getinfo_after_whois_low';
+    pendingQueueBloxlink.push(discordId);
+    try {
+      await sendBloxlinkGetinfo(BLOXLINK_CHANNEL_ID, discordId);
+      console.log('[Monitor]   /getinfo discord_user → ' + pending.discordTag);
+    } catch (e) {
+      console.error('[Monitor]   /getinfo error:', e.message);
+      processedDiscordIds.add(discordId);
+      if (robloxUserId) processedRobloxIds.add(robloxUserId);
+      cleanup(discordId);
+    }
+    return;
   }
 
-  const imageUrls = pending.imageUrls || [];
-  const textContent = pending.content || '';
-
-  const textLower = textContent.toLowerCase();
-  const BUYER_KEYWORDS = [
-    'buying your', 'i buy', 'we buy', 'dm me with',
-    'paying with', 'will buy', 'looking to buy',
-    'buying all', 'buying any', 'i purchase',
-  ];
-  if (BUYER_KEYWORDS.some(kw => textLower.includes(kw))) {
-    console.log('[AI Fallback] Skipped ' + pending.discordTag + ' — buyer/spam post detected');
+  if (!robloxUserId) {
+    if (pending.phase === 'getinfo_after_whois_none') {
+      console.log('[Bloxlink] No Roblox ID for ' + pending.discordTag + ' — skipping');
+    }
     processedDiscordIds.add(discordId);
-    if (robloxUserId) processedRobloxIds.add(robloxUserId);
     cleanup(discordId);
     return;
   }
 
-  let geminiItems = [];
-  if (imageUrls.length) {
-    console.log('[AI Fallback] Analyzing ' + imageUrls.length + ' image(s) for ' + pending.discordTag + '...');
-    try {
-      geminiItems = await analyzeMessageImages(imageUrls);
-    } catch (e) {
-      console.log('[AI Fallback] Gemini error: ' + e.message);
-    }
-  }
-
-  let textItems = [];
-  if (textContent.trim()) {
-    const { above } = findMentionedItems(textContent);
-    textItems = above;
-  }
-
-  if (geminiItems.length > 0 || textItems.length > 0) {
-    if (processedDiscordIds.has(discordId)) { cleanup(discordId); return; }
-
-    const allItems = [...geminiItems, ...textItems];
-    const itemNames = allItems.map(i => i.name + ' (R$ ' + i.value.toLocaleString() + ')').join(', ');
-    console.log('[AI Fallback] HIT for ' + pending.discordTag + ' → ' + itemNames + ' — sending to VALID webhook');
-
-    const bestItem = allItems.sort((a, b) => b.value - a.value)[0];
-    const thumbUrl = bestItem?.id ? await fetchItemThumbnail(bestItem.id) : '';
-
-    const jump = 'https://discord.com/channels/' + pending.guildId + '/' + pending.channelId + '/' + pending.messageId;
-    const embeds = [
-      {
-        title: 'AI-Detected High-Value Items',
-        description:
-          '**Discord:** <@' + pending.discordId + '> (' + pending.discordTag + ')\n' +
-          '**Discord ID:** `' + pending.discordId + '`\n' +
-          '**Channel:** #' + pending.channelName + '\n' +
-          '[Jump to Message](' + jump + ')',
-        color: 0xFF4500,
-        ...(thumbUrl ? { thumbnail: { url: thumbUrl } } : {}),
-      },
-      {
-        title: 'Detected Items',
-        description: allItems.map(i => {
-          const a = i.acronym ? ' [' + i.acronym + ']' : '';
-          return '**' + i.name + '**' + a + ' — R$ ' + i.value.toLocaleString();
-        }).join('\n'),
-        color: 0xFF4500,
-      },
-    ];
-
-    if (robloxUserId) {
-      embeds.splice(1, 0, {
-        title: 'Roblox (below RAP threshold)',
-        description: '[Roblox Profile](https://www.roblox.com/users/' + robloxUserId + '/profile) • [Rolimons](https://www.rolimons.com/player/' + robloxUserId + ')',
-        color: 0xFFAA00,
-      });
-    }
-
-    try {
-      await axios.post(WEBHOOK_VALID, { content: '@everyone', embeds }, { timeout: 10000 });
-      console.log('[AI Fallback] Sent to VALID webhook for ' + pending.discordTag);
-    } catch (e) {
-      console.error('[AI Fallback] Webhook error: ' + e.message);
-    }
-
+  pending.getinfoRobloxId = robloxUserId;
+  if (processedRobloxIds.has(robloxUserId)) {
+    console.log('[Bloxlink] Roblox ' + robloxUserId + ' previously logged — skipping');
     processedDiscordIds.add(discordId);
-    if (robloxUserId) processedRobloxIds.add(robloxUserId);
-  } else {
-    console.log('[AI Fallback] No high-value items found for ' + pending.discordTag + ' — skipping');
+    cleanup(discordId);
+    return;
+  }
+  const lp = '[Bloxlink][' + pending.discordTag + '][Roblox ' + robloxUserId + ']';
+  const [rap, avatarUrl] = await Promise.all([
+    fetchRobloxRAP(robloxUserId, lp),
+    fetchRobloxAvatar(robloxUserId),
+  ]);
+
+  if (rap >= VALUE_THRESHOLD) {
+    console.log(lp + ' RAP HIT → R$ ' + rap.toLocaleString());
+    await sendWebhookAlert({ msg: pending, robloxUserId, rap, avatarUrl, geminiItems: [], textItems: [] });
     processedDiscordIds.add(discordId);
-    if (robloxUserId) processedRobloxIds.add(robloxUserId);
+    processedRobloxIds.add(robloxUserId);
+    cleanup(discordId);
+    return;
   }
 
+  if (pending.phase === 'getinfo_after_whois_none') {
+    console.log(lp + ' RAP below threshold — trying /whois (vice versa)');
+    pending.phase = 'whois_after_getinfo_low';
+    if (!pendingQueueRover.has(pending.whoisChannelId)) pendingQueueRover.set(pending.whoisChannelId, []);
+    pendingQueueRover.get(pending.whoisChannelId).push(discordId);
+    try {
+      await sendRoverWhois(pending.whoisChannelId, discordId);
+      console.log('[Monitor]   /whois discord (vice versa) → ' + pending.discordTag);
+    } catch (e) {
+      console.error('[Monitor]   /whois error:', e.message);
+      processedDiscordIds.add(discordId);
+      processedRobloxIds.add(robloxUserId);
+      cleanup(discordId);
+    }
+    return;
+  }
+
+  console.log(lp + ' RAP below threshold — skipping');
+  processedDiscordIds.add(discordId);
+  processedRobloxIds.add(robloxUserId);
   cleanup(discordId);
 }
 
-// REST poll as backup — fetch messages and look for heist embed
-async function pollForEmbed(channel, messageId, channelId) {
-  const maxAttempts = 6;
-  const delayMs = 3000;
-
-  await new Promise(r => setTimeout(r, 7000));
-  if (processedHeistMsgIds.has(messageId)) return;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const { data: messages } = await axios.get(
-        'https://discord.com/api/v9/channels/' + channelId + '/messages?limit=10',
-        { headers: { Authorization: TOKEN }, timeout: 5000 }
-      );
-
-      // Debug: log what we got
-      for (const raw of messages) {
-        const hasEmbeds = raw.embeds?.length > 0;
-        const isHeist = raw.author?.id === HEIST_BOT_ID;
-        if (isHeist) {
-          console.log('[Heist] DEBUG msg ' + raw.id + ' | embeds: ' + (raw.embeds?.length || 0) + ' | type: ' + raw.type + ' | content: ' + (raw.content || '').slice(0, 80));
-          if (hasEmbeds) {
-            console.log('[Heist] DEBUG embed desc: ' + (raw.embeds[0].description || '(none)').slice(0, 120));
-          }
-        }
-      }
-
-      for (const raw of messages) {
-        if (raw.author?.id !== HEIST_BOT_ID) continue;
-        if (!raw.embeds?.length) continue;
-        if (processedHeistMsgIds.has(raw.id)) continue;
-
-        const embed = raw.embeds[0];
-        const desc = embed.description || '';
-        if (desc.includes('Found:') || desc.includes('Could not find')) {
-          console.log('[Heist] Got embed via REST polling (attempt ' + attempt + '): ' + desc.split('\n')[0]);
-          processedHeistMsgIds.add(raw.id);
-          processedHeistMsgIds.add(messageId);
-          await handleHeistResponse(channelId, embed);
-          return;
-        }
-      }
-
-      console.log('[Heist] Poll attempt ' + attempt + '/' + maxAttempts + ' — no matching embed');
-    } catch (e) {
-      console.log('[Heist] REST poll error (attempt ' + attempt + '): ' + e.message);
-    }
-
-    if (attempt < maxAttempts) {
-      await new Promise(r => setTimeout(r, delayMs));
-      if (processedHeistMsgIds.has(messageId)) return;
-    }
-  }
-
-  console.log('[Heist] No embed after REST polling — giving up');
-  const queue = pendingQueue.get(channelId) || [];
-  if (queue.length) {
-    const discordId = queue.shift();
-    processedDiscordIds.add(discordId);
-    cleanup(discordId);
-  }
-}
-
-// DEBUG: Log all raw heist events (MESSAGE_CREATE + MESSAGE_UPDATE) to see what Discord sends
-if (DEBUG_HEIST_EMBED) {
-  client.on('raw', (packet) => {
-    if (packet.t !== 'MESSAGE_CREATE' && packet.t !== 'MESSAGE_UPDATE') return;
-    const d = packet.d;
-    if (!d.author || d.author.id !== HEIST_BOT_ID) return;
-    if (!WHOIS_CHANNEL_IDS.has(d.channel_id)) return;
-
-    const embedsCount = d.embeds?.length || 0;
-    const desc = d.embeds?.[0]?.description || '(no embed)';
-    const descPreview = String(desc).slice(0, 100);
-
-    console.log('[Heist DEBUG] ' + packet.t + ' | msgId=' + d.id + ' | channel=' + d.channel_id);
-    console.log('[Heist DEBUG]   embeds=' + embedsCount + ' | type=' + d.type + ' | edited=' + !!d.edited_timestamp);
-    console.log('[Heist DEBUG]   desc: ' + descPreview + (desc.length > 100 ? '...' : ''));
-    if (embedsCount > 0 && d.embeds[0].fields?.length) {
-      console.log('[Heist DEBUG]   fields: ' + d.embeds[0].fields.map(f => f.name + '=' + String(f.value).slice(0, 30)).join(' | '));
-    }
-  });
-}
-
-// PRIMARY: Catch heist embed via raw gateway MESSAGE_UPDATE event
-client.on('raw', async (packet) => {
-  if (packet.t !== 'MESSAGE_UPDATE') return;
-  const d = packet.d;
-  if (!d.author || d.author.id !== HEIST_BOT_ID) return;
-  if (!WHOIS_CHANNEL_IDS.has(d.channel_id)) return;
-  if (!d.embeds?.length) return;
-  if (processedHeistMsgIds.has(d.id)) return;
-  if (!pendingQueue.has(d.channel_id) || !pendingQueue.get(d.channel_id).length) return;
-
-  const embed = d.embeds[0];
-  const desc = embed.description || '';
-  if (!desc.includes('Found:') && !desc.includes('Could not find')) return;
-
-  console.log('[Heist] Got embed from raw MESSAGE_UPDATE: ' + desc.split('\n')[0]);
-  processedHeistMsgIds.add(d.id);
-  await handleHeistResponse(d.channel_id, embed);
-});
-
-// Heist message arrives with embed already attached
-client.on('messageCreate', async (message) => {
-  if (message.author?.id !== HEIST_BOT_ID) return;
-  if (!WHOIS_CHANNEL_IDS.has(message.channel.id)) return;
-  if (!pendingQueue.has(message.channel.id) || !pendingQueue.get(message.channel.id).length) return;
-
-  if (DEBUG_HEIST_EMBED) {
-    console.log('[Heist DEBUG] messageCreate (library) | msgId=' + message.id + ' | embeds=' + (message.embeds?.length || 0));
-  }
-
-  if (message.embeds?.length) {
-    console.log('[Heist] Got embed immediately from messageCreate');
-    processedHeistMsgIds.add(message.id);
-    await handleHeistResponse(message.channel.id, message.embeds[0]);
-  } else {
-    console.log('[Heist] Deferred reply (no embed yet) — polling for embed...');
-    pollForEmbed(message.channel, message.id, message.channel.id);
-  }
-});
-
-// Backup: library messageUpdate event
-client.on('messageUpdate', async (oldMessage, newMessage) => {
-  const msg = newMessage.partial ? await newMessage.fetch() : newMessage;
-  if (msg.author?.id !== HEIST_BOT_ID) return;
-  if (!WHOIS_CHANNEL_IDS.has(msg.channel.id)) return;
-
-  if (DEBUG_HEIST_EMBED) {
-    console.log('[Heist DEBUG] messageUpdate (library) | msgId=' + msg.id + ' | embeds=' + (msg.embeds?.length || 0) + ' | fired=' + !!msg.embeds?.length);
-  }
-
-  if (processedHeistMsgIds.has(msg.id)) return;
-  if (!msg.embeds?.length) return;
-  if (!pendingQueue.has(msg.channel.id) || !pendingQueue.get(msg.channel.id).length) return;
-
-  console.log('[Heist] Got embed from messageUpdate');
-  processedHeistMsgIds.add(msg.id);
-  await handleHeistResponse(msg.channel.id, msg.embeds[0]);
-});
+client.on('messageCreate', (msg) => handleBotResponse(msg, false));
+client.on('messageUpdate', (_, msg) => handleBotResponse(msg, true));
 
 // ═══════════════════════════════════════════════════════════════
 //  ERROR HANDLING & LOGIN
