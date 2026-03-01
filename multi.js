@@ -911,20 +911,32 @@ async function handleHeistResponse(channelId, embed) {
   cleanup(discordId);
 }
 
-// Poll via raw Discord REST API (bypasses all library caching)
+// REST poll as backup — fetch messages and look for heist embed
 async function pollForEmbed(channel, messageId, channelId) {
   const maxAttempts = 6;
   const delayMs = 3000;
 
-  await new Promise(r => setTimeout(r, 6000));
+  await new Promise(r => setTimeout(r, 7000));
   if (processedHeistMsgIds.has(messageId)) return;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const { data: messages } = await axios.get(
-        'https://discord.com/api/v9/channels/' + channelId + '/messages?limit=5',
+        'https://discord.com/api/v9/channels/' + channelId + '/messages?limit=10',
         { headers: { Authorization: TOKEN }, timeout: 5000 }
       );
+
+      // Debug: log what we got
+      for (const raw of messages) {
+        const hasEmbeds = raw.embeds?.length > 0;
+        const isHeist = raw.author?.id === HEIST_BOT_ID;
+        if (isHeist) {
+          console.log('[Heist] DEBUG msg ' + raw.id + ' | embeds: ' + (raw.embeds?.length || 0) + ' | type: ' + raw.type + ' | content: ' + (raw.content || '').slice(0, 80));
+          if (hasEmbeds) {
+            console.log('[Heist] DEBUG embed desc: ' + (raw.embeds[0].description || '(none)').slice(0, 120));
+          }
+        }
+      }
 
       for (const raw of messages) {
         if (raw.author?.id !== HEIST_BOT_ID) continue;
@@ -934,7 +946,7 @@ async function pollForEmbed(channel, messageId, channelId) {
         const embed = raw.embeds[0];
         const desc = embed.description || '';
         if (desc.includes('Found:') || desc.includes('Could not find')) {
-          console.log('[Heist] Got embed via REST polling (attempt ' + attempt + '/' + maxAttempts + '): ' + desc.split('\n')[0]);
+          console.log('[Heist] Got embed via REST polling (attempt ' + attempt + '): ' + desc.split('\n')[0]);
           processedHeistMsgIds.add(raw.id);
           processedHeistMsgIds.add(messageId);
           await handleHeistResponse(channelId, embed);
@@ -942,7 +954,7 @@ async function pollForEmbed(channel, messageId, channelId) {
         }
       }
 
-      console.log('[Heist] Poll attempt ' + attempt + '/' + maxAttempts + ' — no embed yet');
+      console.log('[Heist] Poll attempt ' + attempt + '/' + maxAttempts + ' — no matching embed');
     } catch (e) {
       console.log('[Heist] REST poll error (attempt ' + attempt + '): ' + e.message);
     }
@@ -962,6 +974,25 @@ async function pollForEmbed(channel, messageId, channelId) {
   }
 }
 
+// PRIMARY: Catch heist embed via raw gateway MESSAGE_UPDATE event
+client.on('raw', async (packet) => {
+  if (packet.t !== 'MESSAGE_UPDATE') return;
+  const d = packet.d;
+  if (!d.author || d.author.id !== HEIST_BOT_ID) return;
+  if (!WHOIS_CHANNEL_IDS.has(d.channel_id)) return;
+  if (!d.embeds?.length) return;
+  if (processedHeistMsgIds.has(d.id)) return;
+  if (!pendingQueue.has(d.channel_id) || !pendingQueue.get(d.channel_id).length) return;
+
+  const embed = d.embeds[0];
+  const desc = embed.description || '';
+  if (!desc.includes('Found:') && !desc.includes('Could not find')) return;
+
+  console.log('[Heist] Got embed from raw MESSAGE_UPDATE: ' + desc.split('\n')[0]);
+  processedHeistMsgIds.add(d.id);
+  await handleHeistResponse(d.channel_id, embed);
+});
+
 // Heist message arrives with embed already attached
 client.on('messageCreate', async (message) => {
   if (message.author?.id !== HEIST_BOT_ID) return;
@@ -978,7 +1009,7 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-// Heist deferred reply gets edited with the actual embed (backup for polling)
+// Backup: library messageUpdate event
 client.on('messageUpdate', async (oldMessage, newMessage) => {
   const msg = newMessage.partial ? await newMessage.fetch() : newMessage;
   if (msg.author?.id !== HEIST_BOT_ID) return;
@@ -987,7 +1018,7 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
   if (!msg.embeds?.length) return;
   if (!pendingQueue.has(msg.channel.id) || !pendingQueue.get(msg.channel.id).length) return;
 
-  console.log('[Heist] Got embed from messageUpdate (deferred reply edited)');
+  console.log('[Heist] Got embed from messageUpdate');
   processedHeistMsgIds.add(msg.id);
   await handleHeistResponse(msg.channel.id, msg.embeds[0]);
 });
