@@ -522,25 +522,30 @@ async function sendRoverWhois(channelId, userId) {
 async function sendBloxlinkGetinfo(channelId, userId) {
   if (!bloxlinkGetinfoCmd) throw new Error('Bloxlink /getinfo command not loaded');
   const sessionId = client.ws?.shards?.first()?.sessionId || '';
-  await axios.post(
-    'https://discord.com/api/v9/interactions',
-    {
-      type: 2,
-      application_id: BLOXLINK_BOT_ID,
-      guild_id: COMMAND_GUILD_ID,
-      channel_id: channelId,
-      session_id: sessionId,
-      data: {
-        version: bloxlinkGetinfoCmd.version,
-        id: bloxlinkGetinfoCmd.id,
-        name: 'getinfo',
-        type: 1,
-        options: [{ type: 6, name: 'discord_user', value: userId }]
-      },
-      nonce: generateNonce()
+  const payload = {
+    type: 2,
+    application_id: BLOXLINK_BOT_ID,
+    guild_id: COMMAND_GUILD_ID,
+    channel_id: channelId,
+    session_id: sessionId,
+    data: {
+      version: bloxlinkGetinfoCmd.version,
+      id: bloxlinkGetinfoCmd.id,
+      name: 'getinfo',
+      type: 1,
+      options: [{ type: 6, name: 'discord_user', value: String(userId) }]
     },
-    { headers: { Authorization: TOKEN, 'Content-Type': 'application/json' } }
+    nonce: generateNonce()
+  };
+  const res = await axios.post(
+    'https://discord.com/api/v9/interactions',
+    payload,
+    { headers: { Authorization: TOKEN, 'Content-Type': 'application/json' }, validateStatus: () => true }
   );
+  if (res.status !== 204) {
+    const errMsg = res.data?.message || (res.data?.errors ? JSON.stringify(res.data.errors) : res.statusText);
+    throw new Error('Bloxlink ' + res.status + ': ' + errMsg);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -850,7 +855,7 @@ async function handleBotResponse(message, isUpdate) {
   } else {
     if (!isUpdate) return;
     await new Promise(r => setTimeout(r, 1000));
-    const rawMsgs = await fetchRawMessages(BLOXLINK_CHANNEL_ID, 3);
+    const rawMsgs = await fetchRawMessages(channelId, 3);
     const raw = rawMsgs.find(m => m.id === message.id);
     if (raw) {
       robloxUserId = extractFromComponentsV2(raw.components);
@@ -865,7 +870,7 @@ async function handleBotResponse(message, isUpdate) {
       pending.phase = 'getinfo_after_whois_none';
       pendingQueueBloxlink.push(discordId);
       try {
-        await sendBloxlinkGetinfo(BLOXLINK_CHANNEL_ID, discordId);
+        await sendBloxlinkGetinfo(pending.whoisChannelId, discordId);
         console.log('[Monitor]   /getinfo discord_user → ' + pending.discordTag);
       } catch (e) {
         console.error('[Monitor]   /getinfo error:', e.message);
@@ -909,7 +914,7 @@ async function handleBotResponse(message, isUpdate) {
     pending.phase = 'getinfo_after_whois_low';
     pendingQueueBloxlink.push(discordId);
     try {
-      await sendBloxlinkGetinfo(BLOXLINK_CHANNEL_ID, discordId);
+      await sendBloxlinkGetinfo(pending.whoisChannelId, discordId);
       console.log('[Monitor]   /getinfo discord_user → ' + pending.discordTag);
     } catch (e) {
       console.error('[Monitor]   /getinfo error:', e.message);
