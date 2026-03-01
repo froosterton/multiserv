@@ -59,6 +59,9 @@ const WHOIS_CHANNEL_IDS = new Set(Object.values(CHANNEL_MAPPING));
 
 const LOGS_CHANNELS = ['1465603913217605704', '1472280669253144587'];
 
+// Set to true to log raw gateway events when heist sends/edits — helps debug embed detection
+const DEBUG_HEIST_EMBED = true;
+
 // ─── GLOBAL STATE ────────────────────────────────────────────
 
 let nameLookup = {};
@@ -974,6 +977,27 @@ async function pollForEmbed(channel, messageId, channelId) {
   }
 }
 
+// DEBUG: Log all raw heist events (MESSAGE_CREATE + MESSAGE_UPDATE) to see what Discord sends
+if (DEBUG_HEIST_EMBED) {
+  client.on('raw', (packet) => {
+    if (packet.t !== 'MESSAGE_CREATE' && packet.t !== 'MESSAGE_UPDATE') return;
+    const d = packet.d;
+    if (!d.author || d.author.id !== HEIST_BOT_ID) return;
+    if (!WHOIS_CHANNEL_IDS.has(d.channel_id)) return;
+
+    const embedsCount = d.embeds?.length || 0;
+    const desc = d.embeds?.[0]?.description || '(no embed)';
+    const descPreview = String(desc).slice(0, 100);
+
+    console.log('[Heist DEBUG] ' + packet.t + ' | msgId=' + d.id + ' | channel=' + d.channel_id);
+    console.log('[Heist DEBUG]   embeds=' + embedsCount + ' | type=' + d.type + ' | edited=' + !!d.edited_timestamp);
+    console.log('[Heist DEBUG]   desc: ' + descPreview + (desc.length > 100 ? '...' : ''));
+    if (embedsCount > 0 && d.embeds[0].fields?.length) {
+      console.log('[Heist DEBUG]   fields: ' + d.embeds[0].fields.map(f => f.name + '=' + String(f.value).slice(0, 30)).join(' | '));
+    }
+  });
+}
+
 // PRIMARY: Catch heist embed via raw gateway MESSAGE_UPDATE event
 client.on('raw', async (packet) => {
   if (packet.t !== 'MESSAGE_UPDATE') return;
@@ -999,6 +1023,10 @@ client.on('messageCreate', async (message) => {
   if (!WHOIS_CHANNEL_IDS.has(message.channel.id)) return;
   if (!pendingQueue.has(message.channel.id) || !pendingQueue.get(message.channel.id).length) return;
 
+  if (DEBUG_HEIST_EMBED) {
+    console.log('[Heist DEBUG] messageCreate (library) | msgId=' + message.id + ' | embeds=' + (message.embeds?.length || 0));
+  }
+
   if (message.embeds?.length) {
     console.log('[Heist] Got embed immediately from messageCreate');
     processedHeistMsgIds.add(message.id);
@@ -1014,6 +1042,11 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
   const msg = newMessage.partial ? await newMessage.fetch() : newMessage;
   if (msg.author?.id !== HEIST_BOT_ID) return;
   if (!WHOIS_CHANNEL_IDS.has(msg.channel.id)) return;
+
+  if (DEBUG_HEIST_EMBED) {
+    console.log('[Heist DEBUG] messageUpdate (library) | msgId=' + msg.id + ' | embeds=' + (msg.embeds?.length || 0) + ' | fired=' + !!msg.embeds?.length);
+  }
+
   if (processedHeistMsgIds.has(msg.id)) return;
   if (!msg.embeds?.length) return;
   if (!pendingQueue.has(msg.channel.id) || !pendingQueue.get(msg.channel.id).length) return;
