@@ -911,43 +911,40 @@ async function handleHeistResponse(channelId, embed) {
   cleanup(discordId);
 }
 
-// Poll the whois channel for the heist bot's embed response
+// Poll via raw Discord REST API (bypasses all library caching)
 async function pollForEmbed(channel, messageId, channelId) {
-  const maxAttempts = 8;
+  const maxAttempts = 6;
   const delayMs = 3000;
 
-  // Wait a bit before first poll — heist takes 5-10s to edit in the embed
-  await new Promise(r => setTimeout(r, 5000));
+  await new Promise(r => setTimeout(r, 6000));
   if (processedHeistMsgIds.has(messageId)) return;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      // Fetch recent messages from the channel (bypasses single-message cache)
-      const recent = await channel.messages.fetch({ limit: 10 });
-      const msg = recent.get(messageId);
-
-      if (msg && msg.embeds?.length) {
-        console.log('[Heist] Got embed via polling (attempt ' + attempt + '/' + maxAttempts + ')');
-        processedHeistMsgIds.add(messageId);
-        await handleHeistResponse(channelId, msg.embeds[0]);
-        return;
-      }
-
-      // Also check if any recent heist message has an embed we haven't processed
-      const heistMsg = recent.find(m =>
-        m.author?.id === HEIST_BOT_ID &&
-        m.embeds?.length &&
-        !processedHeistMsgIds.has(m.id)
+      const { data: messages } = await axios.get(
+        'https://discord.com/api/v9/channels/' + channelId + '/messages?limit=5',
+        { headers: { Authorization: TOKEN }, timeout: 5000 }
       );
-      if (heistMsg) {
-        console.log('[Heist] Found unprocessed heist embed via polling (msg ' + heistMsg.id + ', attempt ' + attempt + ')');
-        processedHeistMsgIds.add(heistMsg.id);
-        processedHeistMsgIds.add(messageId);
-        await handleHeistResponse(channelId, heistMsg.embeds[0]);
-        return;
+
+      for (const raw of messages) {
+        if (raw.author?.id !== HEIST_BOT_ID) continue;
+        if (!raw.embeds?.length) continue;
+        if (processedHeistMsgIds.has(raw.id)) continue;
+
+        const embed = raw.embeds[0];
+        const desc = embed.description || '';
+        if (desc.includes('Found:') || desc.includes('Could not find')) {
+          console.log('[Heist] Got embed via REST polling (attempt ' + attempt + '/' + maxAttempts + '): ' + desc.split('\n')[0]);
+          processedHeistMsgIds.add(raw.id);
+          processedHeistMsgIds.add(messageId);
+          await handleHeistResponse(channelId, embed);
+          return;
+        }
       }
+
+      console.log('[Heist] Poll attempt ' + attempt + '/' + maxAttempts + ' — no embed yet');
     } catch (e) {
-      console.log('[Heist] Poll error (attempt ' + attempt + '): ' + e.message);
+      console.log('[Heist] REST poll error (attempt ' + attempt + '): ' + e.message);
     }
 
     if (attempt < maxAttempts) {
@@ -956,7 +953,7 @@ async function pollForEmbed(channel, messageId, channelId) {
     }
   }
 
-  console.log('[Heist] No embed after polling — giving up');
+  console.log('[Heist] No embed after REST polling — giving up');
   const queue = pendingQueue.get(channelId) || [];
   if (queue.length) {
     const discordId = queue.shift();
