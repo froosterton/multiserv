@@ -7,10 +7,10 @@
 //   - Gemini Vision AI to analyze posted images for limiteds
 //   - Rolimons database for item identification & valuation
 //   - Roblox inventory API for total RAP
-//   - Rover /whois discord + Bloxlink /getinfo discord_user (dual-command)
+//   - Bloxlink /getinfo FIRST, then Rover /whois (dual-command)
 //
-// AI FALLBACK: When no Roblox linked OR value below threshold,
-// analyzes images + text for valuable items before skipping.
+// AI FALLBACK: After BOTH /getinfo and /whois — if no Roblox ID
+// found OR RAP below threshold from both → analyze images + text.
 //
 // npm install discord.js-selfbot-v13 axios @google/generative-ai
 // ═══════════════════════════════════════════════════════════════
@@ -34,7 +34,7 @@ const BLOXLINK_CHANNEL_ID = '1471499501461176464';
 const ROLIMONS_API_URL = 'https://www.rolimons.com/itemapi/itemdetails';
 const VALUE_THRESHOLD = 100000;
 const ROLIMONS_REFRESH_MINS = 30;
-const AI_FALLBACK_TIMEOUT_MS = 20000; // 20s — run AI fallback if Rover/Bloxlink don't respond
+const AI_FALLBACK_TIMEOUT_MS = 20000;
 
 const MONITOR_CHANNEL_IDS = [
   '907175350348423224', '1391793760354173098', '907175350570717224',
@@ -75,7 +75,7 @@ const processedRobloxIds = new Set();
 const inFlightDiscordIds = new Set();
 const pendingByDiscordId = new Map();
 const pendingQueueRover = new Map();
-const pendingQueueBloxlink = [];
+const pendingQueueBloxlink = new Map();
 const processedBotMessages = new Set();
 const aiFallbackTimeouts = new Map();
 
@@ -342,7 +342,7 @@ function findMentionedItems(text) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  AI FALLBACK — Run when no Roblox ID or value below threshold
+//  AI FALLBACK — Run after BOTH getinfo + whois show no ID or RAP < threshold
 // ═══════════════════════════════════════════════════════════════
 
 function clearAIFallbackTimeout(discordId) {
@@ -364,16 +364,16 @@ function scheduleAIFallbackTimeout(discordId, reason) {
     if (ai.hasValuableItems) {
       await sendWebhookAlert({
         msg: pending,
-        robloxUserId: pending.whoisRobloxId || pending.getinfoRobloxId || null,
-        rap: 0,
-        avatarUrl: '',
+        robloxUserId: pending.getinfoRobloxId || pending.whoisRobloxId || null,
+        rap: pending.getinfoRap ?? pending.whoisRap ?? 0,
+        avatarUrl: pending.avatarUrl || '',
         geminiItems: ai.geminiItems,
         textItems: ai.textItems,
       });
     }
     processedDiscordIds.add(discordId);
-    if (pending.whoisRobloxId) processedRobloxIds.add(pending.whoisRobloxId);
     if (pending.getinfoRobloxId) processedRobloxIds.add(pending.getinfoRobloxId);
+    if (pending.whoisRobloxId) processedRobloxIds.add(pending.whoisRobloxId);
     cleanup(discordId);
   }, AI_FALLBACK_TIMEOUT_MS);
   aiFallbackTimeouts.set(discordId, t);
@@ -463,11 +463,11 @@ async function fetchRobloxRAP(robloxUserId, logPrefix) {
 
 async function fetchRobloxAvatar(robloxUserId) {
   try {
-    const { data } = await axios.get('https://thumbnails.roblox.com/v1/users/avatar-headshot', {
+    const data = await axios.get('https://thumbnails.roblox.com/v1/users/avatar-headshot', {
       params: { userIds: robloxUserId, size: '150x150', format: 'Png', isCircular: false },
       timeout: 3000,
     });
-    return data?.data?.[0]?.imageUrl || '';
+    return data?.data?.data?.[0]?.imageUrl || '';
   } catch { return ''; }
 }
 
@@ -631,7 +631,7 @@ async function sendWebhookAlert({ msg, robloxUserId, rap, avatarUrl, geminiItems
     embeds.push({
       title: 'Roblox & Rolimons',
       description:
-        '**RAP:** R$ ' + rap.toLocaleString() + '\n' +
+        '**RAP:** R$ ' + (rap || 0).toLocaleString() + '\n' +
         '[Roblox Profile](https://www.roblox.com/users/' + robloxUserId + '/profile) • ' +
         '[Rolimons Profile](' + rolimons + ')',
       color: 0x00ff00,
@@ -640,7 +640,7 @@ async function sendWebhookAlert({ msg, robloxUserId, rap, avatarUrl, geminiItems
   } else {
     embeds.push({
       title: 'Roblox Lookup',
-      description: 'Could not resolve Roblox account (Rover/Bloxlink did not respond) — AI fallback triggered',
+      description: 'No Roblox ID from /getinfo or /whois — AI fallback triggered',
       color: 0xFFAA00,
     });
   }
@@ -745,7 +745,7 @@ async function fetchBlockedUsers() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  STARTUP — SEED RECENT USERS SO WE DON'T RE-ALERT ON THEM
+//  STARTUP — SEED RECENT USERS
 // ═══════════════════════════════════════════════════════════════
 
 async function seedRecentUsers() {
@@ -822,7 +822,7 @@ client.on('ready', async () => {
   await loadPreviousLogs(client);
   await seedRecentUsers();
 
-  console.log('[Monitor] Ready — watching ' + MONITOR_CHANNEL_IDS.length + ' channels.\n');
+  console.log('[Monitor] Ready — getinfo first, then whois. AI fallback after both.\n');
 });
 
 // ─── HANDLER 1: SOURCE CHANNEL MESSAGES ──────────────────────
@@ -856,38 +856,34 @@ client.on('messageCreate', async (message) => {
     guildId: message.guild?.id,
     whoisChannelId,
     imageUrls,
+    phase: 'getinfo',
+    getinfoRobloxId: null,
+    getinfoRap: null,
+    whoisRobloxId: null,
+    whoisRap: null,
+    avatarUrl: '',
   };
 
-  pendingByDiscordId.set(discordId, {
-    ...msgData,
-    phase: 'whois',
-    whoisRobloxId: null,
-    getinfoRobloxId: null,
-  });
+  pendingByDiscordId.set(discordId, msgData);
 
-  if (!pendingQueueRover.has(whoisChannelId)) pendingQueueRover.set(whoisChannelId, []);
-  pendingQueueRover.get(whoisChannelId).push(discordId);
+  if (!pendingQueueBloxlink.has(whoisChannelId)) pendingQueueBloxlink.set(whoisChannelId, []);
+  pendingQueueBloxlink.get(whoisChannelId).push(discordId);
 
-  scheduleAIFallbackTimeout(discordId, 'waiting for Rover /whois');
+  scheduleAIFallbackTimeout(discordId, 'waiting for Bloxlink /getinfo');
 
   try {
-    console.log('[Monitor]   /whois discord → ' + discordTag + ' (whois: ' + whoisChannelId + ')');
-    await sendRoverWhois(whoisChannelId, discordId);
+    console.log('[Monitor]   /getinfo discord_user → ' + discordTag + ' (1/2)');
+    await sendBloxlinkGetinfo(whoisChannelId, discordId);
   } catch (e) {
-    console.error('[Monitor]   /whois error: ' + (e.response?.data?.message || e.message));
-    const q = pendingQueueRover.get(whoisChannelId) || [];
+    console.error('[Monitor]   /getinfo error: ' + (e.response?.data?.message || e.message));
+    const q = pendingQueueBloxlink.get(whoisChannelId) || [];
     const idx = q.indexOf(discordId);
     if (idx !== -1) q.splice(idx, 1);
-    const ai = await runAIFallback(msgData);
-    if (ai.hasValuableItems) {
-      await sendWebhookAlert({ msg: msgData, robloxUserId: null, rap: 0, avatarUrl: '', geminiItems: ai.geminiItems, textItems: ai.textItems });
-      processedDiscordIds.add(discordId);
-    }
     cleanup(discordId);
   }
 });
 
-// ─── HANDLER 2: ROVER + BLOXLINK RESPONSES → DUAL-COMMAND FLOW ────
+// ─── HANDLER 2: BLOXLINK + ROVER RESPONSES (getinfo first, then whois) ────
 
 async function handleBotResponse(message, isUpdate) {
   const watchedChannels = [...Object.values(CHANNEL_MAPPING), BLOXLINK_CHANNEL_ID];
@@ -895,17 +891,18 @@ async function handleBotResponse(message, isUpdate) {
   if (message.author.id !== ROVER_BOT_ID && message.author.id !== BLOXLINK_BOT_ID) return;
   if (processedBotMessages.has(message.id)) return;
 
-  const isRover = message.author.id === ROVER_BOT_ID;
+  const isBloxlink = message.author.id === BLOXLINK_BOT_ID;
   const channelId = message.channel.id;
 
   let discordId = null;
-  if (isRover) {
-    const queue = pendingQueueRover.get(channelId) || [];
+  if (isBloxlink) {
+    const queue = pendingQueueBloxlink.get(channelId) || [];
     if (!queue.length) return;
     discordId = queue.shift();
   } else {
-    if (!pendingQueueBloxlink.length) return;
-    discordId = pendingQueueBloxlink.shift();
+    const queue = pendingQueueRover.get(channelId) || [];
+    if (!queue.length) return;
+    discordId = queue.shift();
   }
 
   const pending = pendingByDiscordId.get(discordId);
@@ -914,7 +911,15 @@ async function handleBotResponse(message, isUpdate) {
   clearAIFallbackTimeout(discordId);
 
   let robloxUserId = null;
-  if (isRover) {
+  if (isBloxlink) {
+    if (!isUpdate) return;
+    await new Promise(r => setTimeout(r, 1000));
+    const rawMsgs = await fetchRawMessages(channelId, 3);
+    const raw = rawMsgs.find(m => m.id === message.id);
+    if (raw) {
+      robloxUserId = extractFromComponentsV2(raw.components) || extractFromEmbeds({ embeds: raw.embeds || [] });
+    }
+  } else {
     robloxUserId = extractFromEmbeds(message);
     if (!robloxUserId && isUpdate) {
       await new Promise(r => setTimeout(r, 500));
@@ -924,51 +929,47 @@ async function handleBotResponse(message, isUpdate) {
         robloxUserId = extractFromEmbeds({ embeds: raw.embeds || [] }) || extractFromComponentsV2(raw.components);
       }
     }
-  } else {
-    if (!isUpdate) return;
-    await new Promise(r => setTimeout(r, 1000));
-    const rawMsgs = await fetchRawMessages(channelId, 3);
-    const raw = rawMsgs.find(m => m.id === message.id);
-    if (raw) {
-      robloxUserId = extractFromComponentsV2(raw.components);
-    }
   }
 
   processedBotMessages.add(message.id);
 
-  if (isRover) {
+  if (isBloxlink) {
     if (!robloxUserId) {
-      console.log('[Rover] No Roblox ID for ' + pending.discordTag + ' — trying /getinfo');
-      pending.phase = 'getinfo_after_whois_none';
-      pendingQueueBloxlink.push(discordId);
-      scheduleAIFallbackTimeout(discordId, 'waiting for Bloxlink /getinfo (no Rover ID)');
+      console.log('[Bloxlink] No Roblox ID for ' + pending.discordTag + ' — sending /whois (2/2)');
+      pending.phase = 'whois';
+      if (!pendingQueueRover.has(channelId)) pendingQueueRover.set(channelId, []);
+      pendingQueueRover.get(channelId).push(discordId);
+      scheduleAIFallbackTimeout(discordId, 'waiting for Rover /whois');
       try {
-        await sendBloxlinkGetinfo(pending.whoisChannelId, discordId);
-        console.log('[Monitor]   /getinfo discord_user → ' + pending.discordTag);
+        await sendRoverWhois(channelId, discordId);
+        console.log('[Monitor]   /whois discord → ' + pending.discordTag);
       } catch (e) {
-        console.error('[Monitor]   /getinfo error:', e.message);
+        console.error('[Monitor]   /whois error:', e.message);
+        console.log('[AI Fallback] Both getinfo + whois done (no ID from either) — running AI fallback');
         const ai = await runAIFallback(pending);
         if (ai.hasValuableItems) {
           await sendWebhookAlert({ msg: pending, robloxUserId: null, rap: 0, avatarUrl: '', geminiItems: ai.geminiItems, textItems: ai.textItems });
-          processedDiscordIds.add(discordId);
         }
+        processedDiscordIds.add(discordId);
         cleanup(discordId);
       }
       return;
     }
 
-    pending.whoisRobloxId = robloxUserId;
+    pending.getinfoRobloxId = robloxUserId;
     if (processedRobloxIds.has(robloxUserId)) {
-      console.log('[Rover] Roblox ' + robloxUserId + ' previously logged — skipping');
+      console.log('[Bloxlink] Roblox ' + robloxUserId + ' previously logged — skipping');
       processedDiscordIds.add(discordId);
       cleanup(discordId);
       return;
     }
-    const lp = '[Rover][' + pending.discordTag + '][Roblox ' + robloxUserId + ']';
+    const lp = '[Bloxlink][' + pending.discordTag + '][Roblox ' + robloxUserId + ']';
     const [rap, avatarUrl] = await Promise.all([
       fetchRobloxRAP(robloxUserId, lp),
       fetchRobloxAvatar(robloxUserId),
     ]);
+    pending.getinfoRap = rap;
+    pending.avatarUrl = avatarUrl;
 
     if (rap >= VALUE_THRESHOLD) {
       console.log(lp + ' RAP HIT → R$ ' + rap.toLocaleString());
@@ -979,8 +980,17 @@ async function handleBotResponse(message, isUpdate) {
       return;
     }
 
-    if (pending.phase === 'whois_after_getinfo_low') {
-      console.log(lp + ' RAP below threshold (vice versa) — AI fallback');
+    console.log(lp + ' RAP below threshold — sending /whois (2/2)');
+    pending.phase = 'whois';
+    if (!pendingQueueRover.has(channelId)) pendingQueueRover.set(channelId, []);
+    pendingQueueRover.get(channelId).push(discordId);
+    scheduleAIFallbackTimeout(discordId, 'waiting for Rover /whois');
+    try {
+      await sendRoverWhois(channelId, discordId);
+      console.log('[Monitor]   /whois discord → ' + pending.discordTag);
+    } catch (e) {
+      console.error('[Monitor]   /whois error:', e.message);
+      console.log('[AI Fallback] Both getinfo + whois done — running AI fallback');
       const ai = await runAIFallback(pending);
       if (ai.hasValuableItems) {
         await sendWebhookAlert({ msg: pending, robloxUserId, rap, avatarUrl, geminiItems: ai.geminiItems, textItems: ai.textItems });
@@ -988,54 +998,44 @@ async function handleBotResponse(message, isUpdate) {
       processedDiscordIds.add(discordId);
       processedRobloxIds.add(robloxUserId);
       cleanup(discordId);
-      return;
-    }
-
-    console.log(lp + ' RAP below threshold — trying /getinfo');
-    pending.phase = 'getinfo_after_whois_low';
-    pendingQueueBloxlink.push(discordId);
-    scheduleAIFallbackTimeout(discordId, 'waiting for Bloxlink /getinfo (RAP low)');
-    try {
-      await sendBloxlinkGetinfo(pending.whoisChannelId, discordId);
-      console.log('[Monitor]   /getinfo discord_user → ' + pending.discordTag);
-    } catch (e) {
-      console.error('[Monitor]   /getinfo error:', e.message);
-      const ai = await runAIFallback(pending);
-      if (ai.hasValuableItems) {
-        await sendWebhookAlert({ msg: pending, robloxUserId, rap, avatarUrl, geminiItems: ai.geminiItems, textItems: ai.textItems });
-        processedDiscordIds.add(discordId);
-        processedRobloxIds.add(robloxUserId);
-      }
-      cleanup(discordId);
     }
     return;
   }
 
   if (!robloxUserId) {
-    if (pending.phase === 'getinfo_after_whois_none') {
-      console.log('[Bloxlink] No Roblox ID for ' + pending.discordTag + ' — AI fallback');
-    }
+    console.log('[Rover] No Roblox ID for ' + pending.discordTag);
+    console.log('[AI Fallback] Both getinfo + whois done (no ID or RAP < threshold) — running AI fallback');
     const ai = await runAIFallback(pending);
     if (ai.hasValuableItems) {
-      await sendWebhookAlert({ msg: pending, robloxUserId: null, rap: 0, avatarUrl: '', geminiItems: ai.geminiItems, textItems: ai.textItems });
+      await sendWebhookAlert({
+        msg: pending,
+        robloxUserId: pending.getinfoRobloxId || null,
+        rap: pending.getinfoRap ?? 0,
+        avatarUrl: pending.avatarUrl || '',
+        geminiItems: ai.geminiItems,
+        textItems: ai.textItems,
+      });
     }
     processedDiscordIds.add(discordId);
+    if (pending.getinfoRobloxId) processedRobloxIds.add(pending.getinfoRobloxId);
     cleanup(discordId);
     return;
   }
 
-  pending.getinfoRobloxId = robloxUserId;
+  pending.whoisRobloxId = robloxUserId;
   if (processedRobloxIds.has(robloxUserId)) {
-    console.log('[Bloxlink] Roblox ' + robloxUserId + ' previously logged — skipping');
+    console.log('[Rover] Roblox ' + robloxUserId + ' previously logged — skipping');
     processedDiscordIds.add(discordId);
     cleanup(discordId);
     return;
   }
-  const lp = '[Bloxlink][' + pending.discordTag + '][Roblox ' + robloxUserId + ']';
+  const lp = '[Rover][' + pending.discordTag + '][Roblox ' + robloxUserId + ']';
   const [rap, avatarUrl] = await Promise.all([
     fetchRobloxRAP(robloxUserId, lp),
     fetchRobloxAvatar(robloxUserId),
   ]);
+  pending.whoisRap = rap;
+  if (!pending.avatarUrl) pending.avatarUrl = avatarUrl;
 
   if (rap >= VALUE_THRESHOLD) {
     console.log(lp + ' RAP HIT → R$ ' + rap.toLocaleString());
@@ -1046,35 +1046,23 @@ async function handleBotResponse(message, isUpdate) {
     return;
   }
 
-  if (pending.phase === 'getinfo_after_whois_none') {
-    console.log(lp + ' RAP below threshold — trying /whois (vice versa)');
-    pending.phase = 'whois_after_getinfo_low';
-    if (!pendingQueueRover.has(pending.whoisChannelId)) pendingQueueRover.set(pending.whoisChannelId, []);
-    pendingQueueRover.get(pending.whoisChannelId).push(discordId);
-    scheduleAIFallbackTimeout(discordId, 'waiting for Rover /whois (vice versa)');
-    try {
-      await sendRoverWhois(pending.whoisChannelId, discordId);
-      console.log('[Monitor]   /whois discord (vice versa) → ' + pending.discordTag);
-    } catch (e) {
-      console.error('[Monitor]   /whois error:', e.message);
-      const ai = await runAIFallback(pending);
-      if (ai.hasValuableItems) {
-        await sendWebhookAlert({ msg: pending, robloxUserId, rap, avatarUrl, geminiItems: ai.geminiItems, textItems: ai.textItems });
-      }
-      processedDiscordIds.add(discordId);
-      processedRobloxIds.add(robloxUserId);
-      cleanup(discordId);
-    }
-    return;
-  }
-
-  console.log(lp + ' RAP below threshold — AI fallback');
+  console.log(lp + ' RAP below threshold');
+  console.log('[AI Fallback] Both getinfo + whois done (RAP < 100k from both) — running AI fallback');
   const ai = await runAIFallback(pending);
   if (ai.hasValuableItems) {
-    await sendWebhookAlert({ msg: pending, robloxUserId, rap, avatarUrl, geminiItems: ai.geminiItems, textItems: ai.textItems });
+    await sendWebhookAlert({
+      msg: pending,
+      robloxUserId: pending.whoisRobloxId || pending.getinfoRobloxId,
+      rap: Math.max(pending.whoisRap ?? 0, pending.getinfoRap ?? 0),
+      avatarUrl: pending.avatarUrl || '',
+      geminiItems: ai.geminiItems,
+      textItems: ai.textItems,
+    });
   }
   processedDiscordIds.add(discordId);
-  processedRobloxIds.add(robloxUserId);
+  processedRobloxIds.add(pending.whoisRobloxId || pending.getinfoRobloxId);
+  if (pending.whoisRobloxId) processedRobloxIds.add(pending.whoisRobloxId);
+  if (pending.getinfoRobloxId) processedRobloxIds.add(pending.getinfoRobloxId);
   cleanup(discordId);
 }
 
