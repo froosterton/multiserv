@@ -24,19 +24,17 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const TOKEN = process.env.DISCORD_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
+const WEBHOOK_MAIN = process.env.WEBHOOK_MAIN;
+const WEBHOOK_VALID = process.env.WEBHOOK_VALID;
+
 const ROVER_BOT_ID = '298796807323123712';
 const BLOXLINK_BOT_ID = '426537812993638400';
 const BLOXLINK_CHANNEL_ID = '1471499501461176464';
 
-const WEBHOOK_MAIN =
-  'https://discord.com/api/webhooks/1478623521922875394/SiaFTULmXaxWBidpAUfkqX5apfPwDzPspDWVWhMRTqz6pCx0gu5S6TzHqJ_MfMjaerlx';
-
-const WEBHOOK_VALID =
-  'https://discord.com/api/webhooks/1478623855676227668/JC1OBqOsQ6TWdfyKsJHz__vFeRvEshRJvS-5vlZoCecBnPznfUUIIDQCE6_64KApBPHk';
-
 const ROLIMONS_API_URL = 'https://www.rolimons.com/itemapi/itemdetails';
 const VALUE_THRESHOLD = 100000;
 const ROLIMONS_REFRESH_MINS = 30;
+const AI_FALLBACK_TIMEOUT_MS = 20000; // 20s — run AI fallback if Rover/Bloxlink don't respond
 
 const MONITOR_CHANNEL_IDS = [
   '907175350348423224', '1391793760354173098', '907175350570717224',
@@ -79,6 +77,7 @@ const pendingByDiscordId = new Map();
 const pendingQueueRover = new Map();
 const pendingQueueBloxlink = [];
 const processedBotMessages = new Set();
+const aiFallbackTimeouts = new Map();
 
 let roverWhoisCmd = null;
 let bloxlinkGetinfoCmd = null;
@@ -346,13 +345,50 @@ function findMentionedItems(text) {
 //  AI FALLBACK — Run when no Roblox ID or value below threshold
 // ═══════════════════════════════════════════════════════════════
 
+function clearAIFallbackTimeout(discordId) {
+  const t = aiFallbackTimeouts.get(discordId);
+  if (t) {
+    clearTimeout(t);
+    aiFallbackTimeouts.delete(discordId);
+  }
+}
+
+function scheduleAIFallbackTimeout(discordId, reason) {
+  clearAIFallbackTimeout(discordId);
+  const t = setTimeout(async () => {
+    aiFallbackTimeouts.delete(discordId);
+    const pending = pendingByDiscordId.get(discordId);
+    if (!pending || !inFlightDiscordIds.has(discordId)) return;
+    console.log('[AI Fallback] Timeout — ' + reason + ' for ' + pending.discordTag + ', running AI fallback');
+    const ai = await runAIFallback(pending);
+    if (ai.hasValuableItems) {
+      await sendWebhookAlert({
+        msg: pending,
+        robloxUserId: pending.whoisRobloxId || pending.getinfoRobloxId || null,
+        rap: 0,
+        avatarUrl: '',
+        geminiItems: ai.geminiItems,
+        textItems: ai.textItems,
+      });
+    }
+    processedDiscordIds.add(discordId);
+    if (pending.whoisRobloxId) processedRobloxIds.add(pending.whoisRobloxId);
+    if (pending.getinfoRobloxId) processedRobloxIds.add(pending.getinfoRobloxId);
+    cleanup(discordId);
+  }, AI_FALLBACK_TIMEOUT_MS);
+  aiFallbackTimeouts.set(discordId, t);
+}
+
 async function runAIFallback(pending) {
   if (!geminiModel) return { hasValuableItems: false, geminiItems: [], textItems: [] };
+  console.log('[AI Fallback] Analyzing images + text for ' + (pending.discordTag || 'unknown'));
   const geminiItems = await analyzeMessageImages(pending.imageUrls || []);
   const { above: textItems } = findMentionedItems(pending.content || '');
   const hasValuableItems = geminiItems.length > 0 || textItems.length > 0;
   if (hasValuableItems) {
     console.log('[AI Fallback] Found valuable items: ' + [...geminiItems, ...textItems].map(i => i.name).join(', '));
+  } else {
+    console.log('[AI Fallback] No valuable items found');
   }
   return { hasValuableItems, geminiItems, textItems };
 }
@@ -571,6 +607,10 @@ async function sendBloxlinkGetinfo(channelId, userId) {
 // ═══════════════════════════════════════════════════════════════
 
 async function sendWebhookAlert({ msg, robloxUserId, rap, avatarUrl, geminiItems, textItems }) {
+  if (!WEBHOOK_MAIN || !WEBHOOK_VALID) {
+    console.error('[Webhook] WEBHOOK_MAIN or WEBHOOK_VALID not set — check env vars');
+    return;
+  }
   const jump = 'https://discord.com/channels/' + msg.guildId + '/' + msg.channelId + '/' + msg.messageId;
   const rolimons = robloxUserId ? 'https://www.rolimons.com/player/' + robloxUserId : '';
 
@@ -739,6 +779,7 @@ async function seedRecentUsers() {
 const client = new Client({ checkUpdate: false });
 
 function cleanup(discordId) {
+  clearAIFallbackTimeout(discordId);
   inFlightDiscordIds.delete(discordId);
   pendingByDiscordId.delete(discordId);
 }
@@ -747,6 +788,10 @@ function cleanup(discordId) {
 
 client.on('ready', async () => {
   console.log('[Monitor] Logged in as ' + client.user.tag);
+
+  if (!WEBHOOK_MAIN || !WEBHOOK_VALID) {
+    console.warn('[Monitor] WEBHOOK_MAIN or WEBHOOK_VALID not set — webhooks will not work');
+  }
 
   await fetchBlockedUsers();
   initGemini();
@@ -823,6 +868,8 @@ client.on('messageCreate', async (message) => {
   if (!pendingQueueRover.has(whoisChannelId)) pendingQueueRover.set(whoisChannelId, []);
   pendingQueueRover.get(whoisChannelId).push(discordId);
 
+  scheduleAIFallbackTimeout(discordId, 'waiting for Rover /whois');
+
   try {
     console.log('[Monitor]   /whois discord → ' + discordTag + ' (whois: ' + whoisChannelId + ')');
     await sendRoverWhois(whoisChannelId, discordId);
@@ -831,7 +878,6 @@ client.on('messageCreate', async (message) => {
     const q = pendingQueueRover.get(whoisChannelId) || [];
     const idx = q.indexOf(discordId);
     if (idx !== -1) q.splice(idx, 1);
-    // AI fallback when /whois fails (no Roblox lookup possible)
     const ai = await runAIFallback(msgData);
     if (ai.hasValuableItems) {
       await sendWebhookAlert({ msg: msgData, robloxUserId: null, rap: 0, avatarUrl: '', geminiItems: ai.geminiItems, textItems: ai.textItems });
@@ -865,6 +911,8 @@ async function handleBotResponse(message, isUpdate) {
   const pending = pendingByDiscordId.get(discordId);
   if (!pending) return;
 
+  clearAIFallbackTimeout(discordId);
+
   let robloxUserId = null;
   if (isRover) {
     robloxUserId = extractFromEmbeds(message);
@@ -893,12 +941,12 @@ async function handleBotResponse(message, isUpdate) {
       console.log('[Rover] No Roblox ID for ' + pending.discordTag + ' — trying /getinfo');
       pending.phase = 'getinfo_after_whois_none';
       pendingQueueBloxlink.push(discordId);
+      scheduleAIFallbackTimeout(discordId, 'waiting for Bloxlink /getinfo (no Rover ID)');
       try {
         await sendBloxlinkGetinfo(pending.whoisChannelId, discordId);
         console.log('[Monitor]   /getinfo discord_user → ' + pending.discordTag);
       } catch (e) {
         console.error('[Monitor]   /getinfo error:', e.message);
-        // AI fallback when no Roblox ID and /getinfo fails
         const ai = await runAIFallback(pending);
         if (ai.hasValuableItems) {
           await sendWebhookAlert({ msg: pending, robloxUserId: null, rap: 0, avatarUrl: '', geminiItems: ai.geminiItems, textItems: ai.textItems });
@@ -932,8 +980,7 @@ async function handleBotResponse(message, isUpdate) {
     }
 
     if (pending.phase === 'whois_after_getinfo_low') {
-      console.log(lp + ' RAP below threshold (vice versa) — skipping');
-      // AI fallback when value below threshold
+      console.log(lp + ' RAP below threshold (vice versa) — AI fallback');
       const ai = await runAIFallback(pending);
       if (ai.hasValuableItems) {
         await sendWebhookAlert({ msg: pending, robloxUserId, rap, avatarUrl, geminiItems: ai.geminiItems, textItems: ai.textItems });
@@ -947,12 +994,12 @@ async function handleBotResponse(message, isUpdate) {
     console.log(lp + ' RAP below threshold — trying /getinfo');
     pending.phase = 'getinfo_after_whois_low';
     pendingQueueBloxlink.push(discordId);
+    scheduleAIFallbackTimeout(discordId, 'waiting for Bloxlink /getinfo (RAP low)');
     try {
       await sendBloxlinkGetinfo(pending.whoisChannelId, discordId);
       console.log('[Monitor]   /getinfo discord_user → ' + pending.discordTag);
     } catch (e) {
       console.error('[Monitor]   /getinfo error:', e.message);
-      // AI fallback when value below threshold and /getinfo fails
       const ai = await runAIFallback(pending);
       if (ai.hasValuableItems) {
         await sendWebhookAlert({ msg: pending, robloxUserId, rap, avatarUrl, geminiItems: ai.geminiItems, textItems: ai.textItems });
@@ -968,7 +1015,6 @@ async function handleBotResponse(message, isUpdate) {
     if (pending.phase === 'getinfo_after_whois_none') {
       console.log('[Bloxlink] No Roblox ID for ' + pending.discordTag + ' — AI fallback');
     }
-    // AI fallback when no Roblox linked
     const ai = await runAIFallback(pending);
     if (ai.hasValuableItems) {
       await sendWebhookAlert({ msg: pending, robloxUserId: null, rap: 0, avatarUrl: '', geminiItems: ai.geminiItems, textItems: ai.textItems });
@@ -1005,12 +1051,12 @@ async function handleBotResponse(message, isUpdate) {
     pending.phase = 'whois_after_getinfo_low';
     if (!pendingQueueRover.has(pending.whoisChannelId)) pendingQueueRover.set(pending.whoisChannelId, []);
     pendingQueueRover.get(pending.whoisChannelId).push(discordId);
+    scheduleAIFallbackTimeout(discordId, 'waiting for Rover /whois (vice versa)');
     try {
       await sendRoverWhois(pending.whoisChannelId, discordId);
       console.log('[Monitor]   /whois discord (vice versa) → ' + pending.discordTag);
     } catch (e) {
       console.error('[Monitor]   /whois error:', e.message);
-      // AI fallback when value below threshold and /whois fails
       const ai = await runAIFallback(pending);
       if (ai.hasValuableItems) {
         await sendWebhookAlert({ msg: pending, robloxUserId, rap, avatarUrl, geminiItems: ai.geminiItems, textItems: ai.textItems });
@@ -1022,7 +1068,6 @@ async function handleBotResponse(message, isUpdate) {
     return;
   }
 
-  // RAP below threshold — AI fallback
   console.log(lp + ' RAP below threshold — AI fallback');
   const ai = await runAIFallback(pending);
   if (ai.hasValuableItems) {
