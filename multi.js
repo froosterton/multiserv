@@ -29,10 +29,10 @@ const BLOXLINK_BOT_ID = '426537812993638400';
 const BLOXLINK_CHANNEL_ID = '1471499501461176464';
 
 const WEBHOOK_MAIN =
-  'https://discord.com/api/webhooks/1465603926895235124/Ytb0tM21OCmsqr2TAmkpzd9VxLjP0LApUjkHQBgL_5WHfajsobC2O0CToqbAg13VhLOD';
+  'https://discord.com/api/webhooks/1478623521922875394/SiaFTULmXaxWBidpAUfkqX5apfPwDzPspDWVWhMRTqz6pCx0gu5S6TzHqJ_MfMjaerlx';
 
 const WEBHOOK_VALID =
-  'https://discord.com/api/webhooks/1472280693680898170/bIvHzC9oCQwVRx-JqPfPxxPcbK_3rqkAJfNt6HHacPhYtreSQLI1RljyiVMtkJqLVKoq';
+  'https://discord.com/api/webhooks/1478623855676227668/JC1OBqOsQ6TWdfyKsJHz__vFeRvEshRJvS-5vlZoCecBnPznfUUIIDQCE6_64KApBPHk';
 
 const ROLIMONS_API_URL = 'https://www.rolimons.com/itemapi/itemdetails';
 const VALUE_THRESHOLD = 100000;
